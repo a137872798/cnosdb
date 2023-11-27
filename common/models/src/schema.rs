@@ -57,6 +57,7 @@ pub const USAGE_SCHEMA: &str = "usage_schema";
 pub const DEFAULT_CATALOG: &str = "cnosdb";
 pub const DEFAULT_PRECISION: &str = "NS";
 
+// 针对资源发起的操作
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum ResourceOperator {
     DropTenant(String),
@@ -111,14 +112,20 @@ impl fmt::Display for ResourceStatus {
     }
 }
 
+
+// 代表对资源发起的操作
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ResourceInfo {
     time: i64,
     tenant_id: Oid,
+    // 一组资源名
     names: Vec<String>,
     operator: ResourceOperator,
+    // 尝试次数
     try_count: u64,
+    // 代表在多久后发起  也就是具备延时触发能力
     after: Option<Duration>, // None means now
+    // 描述本次任务的状态
     status: ResourceStatus,
     comment: String,
 }
@@ -191,6 +198,7 @@ impl ResourceInfo {
     }
 }
 
+// schema信息
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum TableSchema {
     TsKvTableSchema(TskvTableSchemaRef),
@@ -280,12 +288,17 @@ impl ExternalTableSchema {
     }
 }
 
+// 存储表的schema信息
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct TskvTableSchema {
+
+    // 当前表的租户名
     pub tenant: String,
     pub db: String,
     pub name: String,
+    // 表示当前的schemaid  每当发生一次变化就会+1
     pub schema_id: SchemaId,
+    // 表示下一个新增的col 对应的id
     next_column_id: ColumnId,
 
     columns: Vec<TableColumn>,
@@ -354,6 +367,7 @@ impl TskvTableSchema {
     }
 
     /// drop column if exists
+    /// 从schema去除某col
     pub fn drop_column(&mut self, col_name: &str) {
         if let Some(id) = self.columns_index.get(col_name) {
             self.columns.remove(*id);
@@ -367,6 +381,7 @@ impl TskvTableSchema {
         self.columns_index = columns_index;
     }
 
+    // 修改某列
     pub fn change_column(&mut self, col_name: &str, new_column: TableColumn) {
         let id = match self.columns_index.get(col_name) {
             None => return,
@@ -504,6 +519,7 @@ pub fn is_time_column(field: &ArrowField) -> bool {
     TIME_FIELD_NAME == field.name()
 }
 
+// 代表table中的某列
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TableColumn {
     pub id: ColumnId,
@@ -757,6 +773,7 @@ impl From<ValueType> for ColumnType {
     }
 }
 
+// 这里并没有 table.schema信息 只有一些database的信息
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct DatabaseSchema {
     tenant: String,
@@ -810,6 +827,7 @@ impl DatabaseSchema {
     }
 
     // return the min timestamp value database allowed to store
+    // 获取支持存储的最小时间戳
     pub fn time_to_expired(&self) -> i64 {
         let (ttl, now) = match self.config.precision_or_default() {
             Precision::MS => (
@@ -845,19 +863,23 @@ pub fn split_owner(owner: &str) -> (&str, &str) {
         .unwrap_or_default()
 }
 
+// 数据库选项
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq, Hash)]
 pub struct DatabaseOptions {
-    // data keep time
+    // data keep time  表示该数据库下的数据保留时间
     ttl: Option<Duration>,
 
+    // 数据库下分片数量 每个分片会被分配到集群的不同节点 那么在查询和写入时又要考虑多分片的分散和聚合
     shard_num: Option<u64>,
-    // shard coverage time range
+    // shard coverage time range  分片覆盖的时间范围?
     vnode_duration: Option<Duration>,
 
+    // 副本数量
     replica: Option<u64>,
-    // timestamp precision
+    // timestamp precision  时间戳精度
     precision: Option<Precision>,
 
+    // 是否隐藏db
     db_is_hidden: bool,
 }
 
@@ -1181,11 +1203,14 @@ impl Tenant {
     }
 }
 
+// 当创建租户时 使用到的相关选项
 #[derive(Debug, Default, Clone, Builder, Serialize, Deserialize)]
 #[builder(setter(into, strip_option), default)]
 pub struct TenantOptions {
     pub comment: Option<String>,
+    // 租户限制配置
     pub limiter_config: Option<TenantLimiterConfig>,
+    // 该租户是否被隐藏
     tenant_is_hidden: bool,
 }
 
@@ -1252,12 +1277,15 @@ impl Display for TenantOptions {
     }
 }
 
+// 水位系统 估计是代表某个列 在多少秒内无法被读取?
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Watermark {
     pub column: String,
     pub delay: StdDuration,
 }
 
+
+//  代表某张表
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct StreamTable {
     tenant: String,
@@ -1401,6 +1429,7 @@ impl From<ScalarValueForkDF> for ScalarValue {
 }
 
 /// column type for tskv
+/// 支持3种列 标签/时间/普通列
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PhysicalCType {
     Tag,

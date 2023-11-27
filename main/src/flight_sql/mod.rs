@@ -20,11 +20,13 @@ mod auth_middleware;
 pub mod flight_sql_server;
 mod utils;
 
+// 适配器本身是作为Service 监听grpc请求的
 pub struct FlightSqlServiceAdapter {
     dbms: DBMSRef,
 
     addr: SocketAddr,
     tls_config: Option<TLSConfig>,
+        // 用于链路追踪
     span_context_extractor: Arc<SpanContextExtractor>,
     handle: Option<ServiceHandle<Result<(), tonic::transport::Error>>>,
 }
@@ -46,9 +48,12 @@ impl FlightSqlServiceAdapter {
     }
 }
 
+// cnosdb 在上层开放了多种接入层  service定义了这些接入层的api
 #[async_trait::async_trait]
 impl Service for FlightSqlServiceAdapter {
     fn start(&mut self) -> crate::server::Result<()> {
+
+        // 创建一个接收终止命令的channel
         let (shutdown, rx) = oneshot::channel();
 
         let server = Server::builder();
@@ -56,6 +61,7 @@ impl Service for FlightSqlServiceAdapter {
         let server = if let Some(TLSConfig {
             certificate,
             private_key,
+            // 尝试读取tls配置
         }) = self.tls_config.as_ref()
         {
             let cert = std::fs::read(certificate)?;
@@ -68,20 +74,25 @@ impl Service for FlightSqlServiceAdapter {
 
         let trace_layer = TraceLayer::new(self.span_context_extractor.clone(), "flight sql");
 
+        // 设置认证器
         let authenticator = GeneratedBearerTokenAuthenticator::new(
             BasicCallHeaderAuthenticator::new(self.dbms.clone()),
         );
+
+        // 生成 flight-sql 服务器
         let svc =
             FlightServiceServer::new(FlightSqlServiceImpl::new(self.dbms.clone(), authenticator));
 
         let server = server
             .layer(trace_layer)
             .add_service(svc)
+            // grpc 本身支持一个shutdown函数
             .serve_with_shutdown(self.addr, async {
                 rx.await.ok();
                 info!("flight rpc server graceful shutdown!");
             });
 
+        // 使用后台线程运行任务
         let handle = tokio::spawn(server);
         self.handle = Some(ServiceHandle::new(
             "flight rpc service".to_string(),

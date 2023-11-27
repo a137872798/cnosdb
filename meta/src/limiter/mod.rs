@@ -41,9 +41,11 @@ pub type LimiterRef = Arc<dyn RequestLimiter>;
 // │                 │                │                  │      x x     x     │
 // │                 └────────────────┘                  │                    │
 // │                                                     └────────────────────┘
-///
+///  双层的限流器 先走本地 再走meta
 #[async_trait]
 pub trait RequestLimiter: Send + Sync + Debug {
+
+    // 下面是针对不同操作的限流
     async fn check_coord_data_in(&self, data_len: usize) -> MetaResult<()>;
     async fn check_coord_data_out(&self, data_len: usize) -> MetaResult<()>;
     async fn check_coord_queries(&self) -> MetaResult<()>;
@@ -56,7 +58,9 @@ pub trait RequestLimiter: Send + Sync + Debug {
     fn as_any(&self) -> &dyn Any;
 }
 
+// 限流器配置
 pub enum LimiterConfig {
+    // 代表某个租户相关的限流器配置
     TenantRequestLimiterConfig {
         tenant: String,
         config: Box<Option<RequestLimiterConfig>>,

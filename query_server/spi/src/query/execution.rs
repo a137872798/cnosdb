@@ -37,35 +37,36 @@ impl Display for QueryType {
     }
 }
 
+// 代表一个查询的执行
 #[async_trait]
 pub trait QueryExecution: Send + Sync {
+
+    // 代表单次直接获取全部结果 还是以流的形式 慢慢得到结果
     fn query_type(&self) -> QueryType {
         QueryType::Batch
     }
-    // 开始
+    // 发起查询 并得到结果
     async fn start(&self) -> Result<Output>;
-    // 停止
+    // 取消查询
     fn cancel(&self) -> Result<()>;
-    // query状态
-    // 查询计划
-    // 静态信息
+    // 获取本次查询相关的信息
     fn info(&self) -> QueryInfo;
-    // 运行时信息
     fn status(&self) -> QueryStatus;
-    // sql
-    // 资源占用（cpu时间/内存/吞吐量等）
     // 是否需要持久化query信息
     fn need_persist(&self) -> bool {
         false
     }
 }
 
+// 代表查询结果
 pub enum Output {
     StreamData(SendableRecordBatchStream),
     Nil(()),
 }
 
 impl Output {
+
+    // 获取本次结果相关的schema
     pub fn schema(&self) -> SchemaRef {
         match self {
             Self::StreamData(stream) => stream.schema(),
@@ -73,9 +74,11 @@ impl Output {
         }
     }
 
+    // 将结果拆分成多块
     pub async fn chunk_result(self) -> Result<Vec<RecordBatch>> {
         match self {
             Self::Nil(_) => Ok(vec![]),
+            // 这里应该会一次将stream的所有数据都拉出来吧
             Self::StreamData(stream) => {
                 let res: Vec<RecordBatch> = stream.try_collect::<Vec<RecordBatch>>().await?;
                 Ok(res)
@@ -108,6 +111,7 @@ impl Stream for Output {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         match this {
+            // 每次poll 得到部分数据
             Output::StreamData(stream) => stream.poll_next_unpin(cx).map_err(|e| e.into()),
             Output::Nil(_) => Poll::Ready(None),
         }
@@ -173,27 +177,37 @@ impl Stream for Output {
 //     }
 // }
 
+// 通过工厂对象生成 execution对象 该对象可以执行查询 并得到结果
 pub trait QueryExecutionFactory {
     fn create_query_execution(
         &self,
-        plan: Plan,
+        plan: Plan,  // 这个计划是cnosdb层的
         query_state_machine: QueryStateMachineRef,
     ) -> Result<QueryExecutionRef>;
 }
 
 pub type QueryStateMachineRef = Arc<QueryStateMachine>;
 
+// 这个就是查询状态机   记录查询执行的状态
 pub struct QueryStateMachine {
+    // 包含datafusion信息
     pub session: SessionCtx,
+    // 包含查询信息
     pub query_id: QueryId,
     pub query: Query,
+    // 各种元数据信息
     pub meta: MetaRef,
+    // 协调中心
     pub coord: CoordinatorRef,
 
+    // 查询当前的状态
     state: AtomicPtr<QueryState>,
+    // 查询开始时间
     start: Instant,
 }
 
+
+// 查询状态机
 impl QueryStateMachine {
     /// only for test
     pub fn test(query: Query, span_context: Option<SpanContext>) -> Self {
@@ -226,8 +240,10 @@ impl QueryStateMachine {
         session: SessionCtx,
         coord: CoordinatorRef,
     ) -> Self {
+        // 通过协调对象获取此时最新的元数据
         let meta = coord.meta_manager();
 
+        // 将相关信息包装起来 变成状态机对象
         Self {
             query_id,
             session,
@@ -239,6 +255,7 @@ impl QueryStateMachine {
         }
     }
 
+    // 代表查询进入分析阶段
     pub fn begin_analyze(&self) {
         // TODO record time
         self.translate_to(Box::new(QueryState::RUNNING(RUNNING::ANALYZING)));
@@ -248,6 +265,7 @@ impl QueryStateMachine {
         // TODO record time
     }
 
+    // 对语句进行优化
     pub fn begin_optimize(&self) {
         // TODO record time
         self.translate_to(Box::new(QueryState::RUNNING(RUNNING::OPTMIZING)));
@@ -257,6 +275,7 @@ impl QueryStateMachine {
         // TODO
     }
 
+    // 应该是要把查询分派到不同节点进行
     pub fn begin_schedule(&self) {
         // TODO
         self.translate_to(Box::new(QueryState::RUNNING(RUNNING::SCHEDULING)));
@@ -266,16 +285,19 @@ impl QueryStateMachine {
         // TODO
     }
 
+    // 代表查询结束了
     pub fn finish(&self) {
         // TODO
         self.translate_to(Box::new(QueryState::DONE(DONE::FINISHED)));
     }
 
+    // 查询被取消
     pub fn cancel(&self) {
         // TODO
         self.translate_to(Box::new(QueryState::DONE(DONE::CANCELLED)));
     }
 
+    // 本次查询失败
     pub fn fail(&self) {
         // TODO
         self.translate_to(Box::new(QueryState::DONE(DONE::FAILED)));
@@ -293,6 +315,7 @@ impl QueryStateMachine {
         self.state.store(Box::into_raw(state), Ordering::Relaxed);
     }
 
+    // 关联一个链路追踪的上下文
     pub fn with_span_ctx(&self, span_ctx: Option<SpanContext>) -> Self {
         let state = AtomicPtr::new(Box::into_raw(Box::new(self.state().clone())));
         Self {
@@ -307,10 +330,14 @@ impl QueryStateMachine {
     }
 }
 
+// 表示查询的状态
 #[derive(Debug, Clone)]
 pub enum QueryState {
+    // 刚接收到查询请求
     ACCEPTING,
+    // 表示处在查询的几个阶段
     RUNNING(RUNNING),
+    // 已经结束了 无论是正常结束 或者非正常结束
     DONE(DONE),
 }
 
@@ -324,6 +351,7 @@ impl AsRef<str> for QueryState {
     }
 }
 
+// 查询的几个阶段
 #[derive(Debug, Clone)]
 pub enum RUNNING {
     DISPATCHING,

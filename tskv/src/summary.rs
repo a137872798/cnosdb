@@ -31,6 +31,7 @@ use crate::{byte_utils, file_utils, ColumnFileId, LevelId, TseriesFamilyId};
 
 const MAX_BATCH_SIZE: usize = 64;
 
+// 描述一个数据文件
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone)]
 pub struct CompactMeta {
     pub file_id: ColumnFileId,
@@ -79,6 +80,8 @@ impl From<&ColumnFile> for CompactMeta {
 }
 
 impl CompactMeta {
+
+    // 返回文件路径
     pub fn file_path(
         &self,
         storage_opt: &StorageOptions,
@@ -94,12 +97,13 @@ impl CompactMeta {
         }
     }
 
+    // 修改文件名
     pub async fn rename_file(
         &mut self,
         storage_opt: &StorageOptions,
         database: &str,
         ts_family_id: TseriesFamilyId,
-        file_id: ColumnFileId,
+        file_id: ColumnFileId,  // 基于新id 生成新path
     ) -> Result<PathBuf> {
         let old_name = if self.is_delta {
             let base_dir = storage_opt
@@ -158,13 +162,14 @@ impl CompactMetaBuilder {
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone)]
 pub struct VersionEdit {
     pub has_seq_no: bool,
-    pub seq_no: u64,
+    pub seq_no: u64,  // 此时出现的最大时间戳
     pub has_file_id: bool,
-    pub file_id: u64,
+    pub file_id: u64,  // 当往本对象中不断添加文件时 对应最大的文件id
     pub max_level_ts: Timestamp,
-    pub add_files: Vec<CompactMeta>,
+    pub add_files: Vec<CompactMeta>,  // 相比之前version的变化 每个 CompactMeta中包含level和文件id
     pub del_files: Vec<CompactMeta>,
 
+    // 代表是一个添加/移除 vnode操作
     pub del_tsf: bool,
     pub add_tsf: bool,
     pub tsf_id: TseriesFamilyId,
@@ -226,6 +231,8 @@ impl VersionEdit {
 
     pub fn encode_vec(data: &[Self]) -> Result<Vec<u8>> {
         let mut buf: Vec<u8> = Vec::with_capacity(data.len() * 32);
+
+        // 将多个edit编码后设置到buf中
         for ve in data {
             let ve_buf =
                 bincode::serialize(ve).map_err(|e| Error::RecordFileEncode { source: (e) })?;
@@ -258,6 +265,7 @@ impl VersionEdit {
         Ok(list)
     }
 
+    // 某个合并元数据 以及这些数据相关的最大时间戳
     pub fn add_file(&mut self, compact_meta: CompactMeta, max_level_ts: i64) {
         if compact_meta.high_seq != 0 {
             // ComapctMeta.seq_no only makes sense when flush.
@@ -272,6 +280,7 @@ impl VersionEdit {
         self.add_files.push(compact_meta);
     }
 
+    // 标记这些文件已经被删除了  一般是在compact后 之前的旧文件就可以删除了
     pub fn del_file(&mut self, level: LevelId, file_id: u64, is_delta: bool) {
         self.del_files.push(CompactMeta {
             file_id,
@@ -289,19 +298,20 @@ impl Display for VersionEdit {
     }
 }
 
+// 一个描述信息 相当于是一个清单对象 一开始通过加载清单对象可以知道有哪些version 以及他们下面各level相关的数据文件
 pub struct Summary {
-    meta: MetaRef,
+    meta: MetaRef,  // 通过该对象与元数据服务交互
     file_no: u64,
-    version_set: Arc<RwLock<VersionSet>>,
+    version_set: Arc<RwLock<VersionSet>>,  // 维护多个数据库的版本数据
     ctx: Arc<GlobalContext>,
-    writer: Writer,
+    writer: Writer,   // 该对象与底层的某个 record文件连接 (record文件可以写入summary格式数据)
     opt: Arc<Options>,
-    runtime: Arc<Runtime>,
+    runtime: Arc<Runtime>,   // tokio的异步运行时
     metrics_register: Arc<MetricsRegister>,
 }
 
 impl Summary {
-    // create a new summary file
+    // create a new summary file    创建一个新的summary对象   总结对象
     pub async fn new(
         opt: Arc<Options>,
         runtime: Arc<Runtime>,
@@ -310,9 +320,14 @@ impl Summary {
         metrics_register: Arc<MetricsRegister>,
     ) -> Result<Self> {
         let db = VersionEdit::default();
+        // 专门有目录存储总结文件信息
         let path = file_utils::make_summary_file(opt.storage.summary_dir(), 0);
+
+        // record文件 可以用于存储4种类型的数据 这里创建用于存储summary信息的文件
         let mut w = Writer::open(path, RecordDataType::Summary).await.unwrap();
         let buf = db.encode()?;
+
+        // 现在写入的还是空数据
         let _ = w
             .write_record(
                 RecordDataVersion::V1.into(),
@@ -344,6 +359,7 @@ impl Summary {
     ///
     /// If `load_file_filter` is `true`, field_filter will be loaded from file,
     /// otherwise default `BloomFilter::default()`
+    /// 从已经存在的summary文件恢复数据
     #[allow(clippy::too_many_arguments)]
     pub async fn recover(
         meta: MetaRef,
@@ -356,7 +372,11 @@ impl Summary {
         metrics_register: Arc<MetricsRegister>,
     ) -> Result<Self> {
         let summary_path = opt.storage.summary_dir();
+
+        // 找到之前的summary文件
         let path = file_utils::make_summary_file(&summary_path, 0);
+
+        // 文件已存在 就会续写
         let writer = Writer::open(path, RecordDataType::Summary).await.unwrap();
         let ctx = Arc::new(GlobalContext::default());
         let rd = Box::new(
@@ -364,6 +384,7 @@ impl Summary {
                 .await
                 .unwrap(),
         );
+        // 通过读取文件 加载summary
         let vs = Self::recover_version(
             meta.clone(),
             rd,
@@ -397,26 +418,32 @@ impl Summary {
     #[allow(clippy::too_many_arguments)]
     pub async fn recover_version(
         meta: MetaRef,
-        mut reader: Box<Reader>,
+        mut reader: Box<Reader>,  // 通过reader对象读取数据
         ctx: &GlobalContext,
         opt: Arc<Options>,
         runtime: Arc<Runtime>,
         memory_pool: MemoryPoolRef,
         flush_task_sender: Sender<FlushReq>,
         compact_task_sender: Sender<CompactTask>,
-        load_field_filter: bool,
+        load_field_filter: bool,  // 是否需要读取布隆过滤器
         metrics_register: Arc<MetricsRegister>,
     ) -> Result<VersionSet> {
+        // 记录针对某个列族的某次version变化
         let mut tsf_edits_map: HashMap<TseriesFamilyId, Vec<VersionEdit>> = HashMap::new();
         let mut database_map: HashMap<String, Arc<String>> = HashMap::new();
+        // 代表该列族关联的是哪个db
         let mut tsf_database_map: HashMap<TseriesFamilyId, Arc<String>> = HashMap::new();
 
         loop {
+            // 按照既定的格式 读取一条record
             let res = reader.read_record().await;
             match res {
                 Ok(result) => {
+                    // 还原成 versionEdit
                     let ed = VersionEdit::decode(&result.data)?;
+
                     if ed.add_tsf {
+                        // 看来针对 versionSet的操作都被记录下来了 可以一步步还原
                         let db_ref = database_map
                             .entry(ed.tsf_name.clone())
                             .or_insert_with(|| Arc::new(ed.tsf_name.clone()));
@@ -429,6 +456,7 @@ impl Summary {
                     } else if ed.del_tsf {
                         tsf_edits_map.remove(&ed.tsf_id);
                         tsf_database_map.remove(&ed.tsf_id);
+                        // 代表追加
                     } else if let Some(data) = tsf_edits_map.get_mut(&ed.tsf_id) {
                         data.push(ed);
                     }
@@ -445,13 +473,20 @@ impl Summary {
         let mut max_seq_no_all = 0_u64;
         let mut has_file_id = false;
         let mut max_file_id_all = 0_u64;
+
+        // 遍历所有列族  相关的edit
         for (tsf_id, edits) in tsf_edits_map {
+
+            // 获取列族相关的db名
             let database = tsf_database_map.remove(&tsf_id).unwrap();
 
             let mut files: HashMap<u64, CompactMeta> = HashMap::new();
             let mut max_seq_no = 0;
             let mut max_level_ts = i64::MIN;
+
+            // 遍历每次变化
             for e in edits {
+                // 如果本次edit 有序列号 和 file_id  则更新max
                 if e.has_seq_no {
                     max_seq_no = std::cmp::max(max_seq_no, e.seq_no);
                     max_seq_no_all = std::cmp::max(max_seq_no_all, e.seq_no);
@@ -460,6 +495,8 @@ impl Summary {
                     has_file_id = true;
                     max_file_id_all = std::cmp::max(max_file_id_all, e.file_id);
                 }
+
+                // 更新 max_level_ts
                 max_level_ts = std::cmp::max(max_level_ts, e.max_level_ts);
                 for m in e.del_files {
                     files.remove(&m.file_id);
@@ -474,21 +511,30 @@ impl Summary {
                 opt.storage.max_cached_readers,
             ));
             let weak_tsm_reader_cache = Arc::downgrade(&tsm_reader_cache);
+
+            // 产生level_info 数组
             let mut levels = LevelInfo::init_levels(database.clone(), tsf_id, opt.storage.clone());
+
+            // 遍历元数据 找到那些数据文件
             for meta in files.into_values() {
                 let field_filter = if load_field_filter {
+                    // 打开这些数据文件reader对象 获取他们的布隆过滤器
                     let tsm_path = meta.file_path(opt.storage.as_ref(), &database, tsf_id);
                     let tsm_reader = TsmReader::open(tsm_path).await?;
                     tsm_reader.bloom_filter()
                 } else {
                     Arc::new(BloomFilter::default())
                 };
+
+                // 每个文件填充到level中
                 levels[meta.level as usize].push_compact_meta(
                     &meta,
                     field_filter,
                     weak_tsm_reader_cache.clone(),
                 );
             }
+
+            // 当某个列族相关的所有数据都已经读取完毕后 可以初始化version了
             let ver = Version::new(
                 tsf_id,
                 database,
@@ -498,12 +544,16 @@ impl Summary {
                 max_level_ts,
                 tsm_reader_cache,
             );
+            // 所有version 组成了VersionSet
             versions.insert(tsf_id, Arc::new(ver));
         }
 
+        // 代表确实出现了文件  在上下文中记录下个文件的id
         if has_file_id {
             ctx.set_file_id(max_file_id_all + 1);
         }
+
+        // 根据相关信息 产生VersionSet
         let vs = VersionSet::new(
             meta,
             opt,
@@ -519,31 +569,38 @@ impl Summary {
     }
 
     /// Applies version edit to summary file, and generates new version for TseriesFamily.
+    /// 作用一组 VersionEdit
     pub async fn apply_version_edit(
         &mut self,
         version_edits: Vec<VersionEdit>,
         file_metas: HashMap<ColumnFileId, Arc<BloomFilter>>,
-        mem_caches: HashMap<TseriesFamilyId, Vec<Arc<SyncRwLock<MemCache>>>>,
+        mem_caches: HashMap<TseriesFamilyId, Vec<Arc<SyncRwLock<MemCache>>>>,   // 代表此时要维护的缓存
     ) -> Result<()> {
         self.write_summary(version_edits, file_metas, mem_caches)
             .await?;
+        // 判断是否要生成快照
         self.roll_summary_file().await?;
         Ok(())
     }
 
     /// Write VersionEdits into summary file, generate and then apply new Versions for TseriesFamilies.
+    /// 写入一组 summary数据
     async fn write_summary(
         &mut self,
         version_edits: Vec<VersionEdit>,
         mut file_metas: HashMap<ColumnFileId, Arc<BloomFilter>>,
-        mem_caches: HashMap<TseriesFamilyId, Vec<Arc<SyncRwLock<MemCache>>>>,
+        mem_caches: HashMap<TseriesFamilyId, Vec<Arc<SyncRwLock<MemCache>>>>,  // 新版本要维护的缓存
     ) -> Result<()> {
         // Write VersionEdits into summary file and join VersionEdits by Database/TseriesFamilyId.
         let mut tsf_version_edits: HashMap<TseriesFamilyId, Vec<VersionEdit>> = HashMap::new();
         let mut tsf_min_seq: HashMap<TseriesFamilyId, u64> = HashMap::new();
         let mut del_tsf: HashSet<TseriesFamilyId> = HashSet::new();
+
+        // 遍历本次相关的所有edit
         for edit in version_edits.into_iter() {
             let buf = edit.encode()?;
+
+            // 将edit挨个记录到 record文件中
             let _ = self
                 .writer
                 .write_record(
@@ -554,6 +611,7 @@ impl Summary {
                 .await?;
             self.writer.sync().await?;
 
+            // 同时设置到内存   (按照列族分组)
             tsf_version_edits
                 .entry(edit.tsf_id)
                 .or_default()
@@ -568,15 +626,23 @@ impl Summary {
 
         // For each TsereiesFamily - VersionEdits，generate a new Version and then apply it.
         let version_set = self.version_set.read().await;
+
+        // 现在将这些edit作用到内存数据上
         for (tsf_id, edits) in tsf_version_edits {
             let min_seq = tsf_min_seq.get(&tsf_id);
+
+            // 如果处理 del_tsf为true的edit 在之前已经从version_set中删除了该列族的数据了  返回None 也就不会更新version了
             if let Some(tsf) = version_set.get_tsfamily_by_tf_id(tsf_id).await {
                 trace::info!("Applying new version for ts_family {}.", tsf_id);
+
+                // 将edit作用到version上 产生新的version
                 let new_version = tsf.read().await.version().copy_apply_version_edits(
                     edits,
                     &mut file_metas,
                     min_seq.copied(),
                 );
+
+                // 更新当前列族的version 和缓存数据
                 let flushed_mem_cahces = mem_caches.get(&tsf_id);
                 tsf.write()
                     .await
@@ -589,13 +655,16 @@ impl Summary {
         Ok(())
     }
 
+    // 检查当前summary文件是否过长 并产生快照文件
     async fn roll_summary_file(&mut self) -> Result<()> {
         if self.writer.file_size() >= self.opt.storage.max_summary_size {
+            // 为当前VersionSet中 各个version生成快照
             let (edits, file_metas) = {
                 let vs = self.version_set.read().await;
                 vs.snapshot().await
             };
 
+            // 将数据写入临时文件 并打算替换本文件
             let new_path = &file_utils::make_summary_file_tmp(self.opt.storage.summary_dir());
             let old_path = &self.writer.path().clone();
             if try_exists(new_path) {
@@ -701,7 +770,7 @@ pub async fn print_summary_statistics(path: impl AsRef<Path>) {
 
 pub struct SummaryProcessor {
     summary: Box<Summary>,
-    cbs: Vec<OneShotSender<Result<()>>>,
+    cbs: Vec<OneShotSender<Result<()>>>,  // 用于回复结果
     edits: Vec<VersionEdit>,
     file_metas: HashMap<ColumnFileId, Arc<BloomFilter>>,
     mem_caches: HashMap<TseriesFamilyId, Vec<Arc<SyncRwLock<MemCache>>>>,
@@ -718,6 +787,7 @@ impl SummaryProcessor {
         }
     }
 
+    // 把task的信息 都添加到processor中
     pub fn batch(&mut self, task: SummaryTask) {
         if let Some(file_metas) = task.file_metas {
             self.file_metas.extend(file_metas);
@@ -725,11 +795,13 @@ impl SummaryProcessor {
         if let Some(mem_caches) = task.mem_caches {
             self.mem_caches.extend(mem_caches);
         }
+
         let mut req = task.request;
         self.edits.append(&mut req.version_edits);
         self.cbs.push(req.call_back);
     }
 
+    // 将本对象所有edit作用到summary上
     pub async fn apply(&mut self) {
         let edits = std::mem::replace(&mut self.edits, Vec::with_capacity(32));
         let file_metas = std::mem::take(&mut self.file_metas);
@@ -739,6 +811,7 @@ impl SummaryProcessor {
             .apply_version_edit(edits, file_metas, mem_caches)
             .await
         {
+            // 作用完所有更新后  通过send回复结果
             Ok(()) => {
                 for cb in self.cbs.drain(..) {
                     let _ = cb.send(Ok(()));
@@ -758,9 +831,10 @@ impl SummaryProcessor {
     }
 }
 
+// 总结任务
 #[derive(Debug)]
 pub struct SummaryTask {
-    pub request: WriteSummaryRequest,
+    pub request: WriteSummaryRequest,   // 内部包含了一组 edit 需要将这些作用到summary上
     pub file_metas: Option<HashMap<ColumnFileId, Arc<BloomFilter>>>,
     pub mem_caches: Option<HashMap<TseriesFamilyId, Vec<Arc<SyncRwLock<MemCache>>>>>,
 }
@@ -783,12 +857,14 @@ impl SummaryTask {
     }
 }
 
+// 代表需要将这些edit作用到summary上
 #[derive(Debug)]
 pub struct WriteSummaryRequest {
     pub version_edits: Vec<VersionEdit>,
     pub call_back: OneShotSender<Result<()>>,
 }
 
+// 调度器用于发送summary任务
 #[derive(Clone)]
 pub struct SummaryScheduler {
     sender: Sender<SummaryTask>,

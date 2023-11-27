@@ -10,6 +10,7 @@ use crate::http::header::Header;
 
 #[derive(Clone)]
 pub struct BasicCallHeaderAuthenticator {
+    // 这个对应的是下层的数据库对象
     instance: DBMSRef,
 }
 
@@ -23,19 +24,25 @@ impl BasicCallHeaderAuthenticator {
 impl CallHeaderAuthenticator for BasicCallHeaderAuthenticator {
     type AuthResult = CommonAuthResult;
 
+    // 认证逻辑 就是从请求头获取部分信息 并通过下层的数据库 完成认证
     async fn authenticate(&self, req_headers: &MetadataMap) -> Result<Self::AuthResult, Status> {
         debug!("authenticate, request headers: {:?}", req_headers);
 
+        // 获取认证相关头部
         let authorization = utils::get_value_from_auth_header(req_headers, "")
             .ok_or_else(|| Status::unauthenticated("authorization field not present"))?;
+        // 获取 X-CnosDB-PrivateKey 头 这是一个自定义请求头
         let private_key = utils::get_value_from_header(req_headers, PRIVATE_KEY, "");
 
+        // 从认证头中拆解出用户名/密码
         let user_info = Header::with_private_key(None, authorization, private_key)
             .try_get_basic_auth()
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
+        // 获取租户信息
         let tenant = utils::get_value_from_header(req_headers, header::TENANT, "");
 
+        // 通过与db交互 拿到用户信息  因为请求头只能拆解出用户名密码  但是这些不一定正确 还是要通过下层数据库系统进行查询
         let user = self
             .instance
             .authenticate(&user_info, tenant.as_deref())

@@ -18,11 +18,15 @@ struct Cli {
     config: Option<String>,
 }
 
+// 元数据服务器
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    // 读取配置文件 根据信息来启动元数据服务器
     let options = store::config::get_opt(cli.config);
     let logs_path = format!("{}/{}", options.log.path, options.id);
+
+    // TODO 链路追踪的先忽略
     init_process_global_tracing(
         &logs_path,
         &options.log.level,

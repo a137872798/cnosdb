@@ -11,6 +11,7 @@ use crate::errors::ReplicationError;
 use crate::raft_node::RaftNode;
 use crate::{RaftNodeId, RaftNodeInfo};
 
+// admin作为代理对象 用于与raft节点交互
 pub struct RaftHttpAdmin {
     node: Arc<RaftNode>,
 }
@@ -34,6 +35,7 @@ impl RaftHttpAdmin {
         warp::path!("init")
             .and(self.with_raft_node())
             .and_then(|node: Arc<RaftNode>| async move {
+                // 使用单个节点先初始化raft集群
                 let rsp = match node.raft_init(BTreeMap::new()).await {
                     Ok(_) => Ok(()),
                     Err(err) => Err(err.to_string()),
@@ -41,11 +43,11 @@ impl RaftHttpAdmin {
 
                 let data = serde_json::to_string(&rsp).unwrap_or_default();
                 let res: Result<String, warp::Rejection> = Ok(data);
-
                 res
             })
     }
 
+    // 往集群中添加一个节点
     fn add_learner(
         &self,
     ) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
@@ -72,6 +74,7 @@ impl RaftHttpAdmin {
             })
     }
 
+    // 修改group成员
     fn change_membership(
         &self,
     ) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
@@ -103,6 +106,7 @@ impl RaftHttpAdmin {
             })
     }
 
+    // 设置handle路由
     pub fn routes(
         &self,
     ) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {

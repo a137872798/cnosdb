@@ -23,20 +23,25 @@ use tskv::{wal, EngineRef};
 use crate::errors::*;
 use crate::{get_replica_all_info, update_replication_set};
 
+// 代表一个基于raft协议的写入请求
+// 如果采用副本集部署的方式 副本集通过raft协议来确保数据同步
 pub struct RaftWriteRequest {
-    pub points: WritePointsRequest,
-    pub precision: Precision,
+    pub points: WritePointsRequest,  // 内部包含数据
+    pub precision: Precision,  // 时间精度
 }
 
+// 每个参与raft集群的节点 都要部署一个 RaftNodesManager
 pub struct RaftNodesManager {
-    meta: MetaRef,
+    meta: MetaRef,  // 用于与元数据服务交互
     config: config::Config,
-    kv_inst: Option<EngineRef>,
-    raft_state: Arc<StateStorage>,
-    raft_nodes: Arc<RwLock<MultiRaft>>,
+    kv_inst: Option<EngineRef>,  // tskv存储
+    raft_state: Arc<StateStorage>,  // 存储raft状态信息
+    raft_nodes: Arc<RwLock<MultiRaft>>,  // 维护每个副本集中的一个节点
 }
 
 impl RaftNodesManager {
+
+    // 初始化管理器
     pub fn new(config: config::Config, meta: MetaRef, kv_inst: Option<EngineRef>) -> Self {
         let path = PathBuf::from(config.storage.path.clone()).join("raft-state");
         let state = StateStorage::open(path).unwrap();
@@ -67,11 +72,14 @@ impl RaftNodesManager {
         }
     }
 
+    // 启动所有副本节点
     pub async fn start_all_raft_node(&self) -> CoordinatorResult<()> {
+        // 获取所有节点的描述信息
         let nodes_summary = self.raft_state.all_nodes_summary()?;
         let mut nodes = self.raft_nodes.write().await;
         for summary in nodes_summary {
             let node = self
+                // 启动所有raft节点   实际上这个组件内的每个raft节点都会关联到某个副本集的副本  这样就能在集群层面确保副本数据一致性
                 .open_raft_node(
                     &summary.tenant,
                     &summary.db_name,
@@ -88,6 +96,7 @@ impl RaftNodesManager {
         Ok(())
     }
 
+    // 获取某个副本集相关的raft节点   不存在则创建
     pub async fn get_node_or_build(
         &self,
         tenant: &str,
@@ -98,6 +107,7 @@ impl RaftNodesManager {
             return Ok(node);
         }
 
+        // 一定要leader节点才有权限构建组  同时会通知副本组其他节点 自动加入副本组
         let result = self.build_replica_group(tenant, db_name, replica).await;
         if let Err(err) = &result {
             info!("build replica group failed: {:?}, {:?}", replica, err);
@@ -108,6 +118,7 @@ impl RaftNodesManager {
         result
     }
 
+    // 启动一个raft节点
     pub async fn exec_open_raft_node(
         &self,
         tenant: &str,
@@ -127,6 +138,7 @@ impl RaftNodesManager {
         Ok(())
     }
 
+    // 本节点不再维护某个副本组的副本
     pub async fn exec_drop_raft_node(
         &self,
         tenant: &str,
@@ -137,11 +149,13 @@ impl RaftNodesManager {
         info!("exec drop raft node: {}.{}", group_id, id);
         let mut nodes = self.raft_nodes.write().await;
         if let Some(raft_node) = nodes.get_node(group_id) {
+            // 终止raft节点  并清理本地数据
             raft_node.shutdown().await?;
             nodes.rm_node(group_id);
 
             let vnode_id = raft_node.raft_id() as VnodeId;
             if let Some(storage) = &self.kv_inst {
+                // 删除本地数据
                 let err = storage.remove_tsfamily(tenant, db_name, vnode_id).await;
                 info!("drop raft node remove tsfamily: {:?}", err);
             }
@@ -154,28 +168,36 @@ impl RaftNodesManager {
         Ok(())
     }
 
+    // 构建副本组
     async fn build_replica_group(
         &self,
         tenant: &str,
         db_name: &str,
         replica: &ReplicationSet,
     ) -> CoordinatorResult<Arc<RaftNode>> {
+
+        // leader节点才有权限生成副本组
         if replica.leader_node_id != self.node_id() {
             return Err(CoordinatorError::LeaderIsWrong {
                 replica: replica.clone(),
             });
         }
 
+        // 获取锁后 先检查一次
         let mut nodes = self.raft_nodes.write().await;
         if let Some(node) = nodes.get_node(replica.id) {
             return Ok(node);
         }
 
         let mut cluster_nodes = BTreeMap::new();
+
+        // 启动leader节点
         let leader_id = replica.leader_vnode_id;
         let raft_node = self
             .open_raft_node(tenant, db_name, leader_id, replica.id)
             .await?;
+
+        // leader首次创建副本组后 远程命令其他节点启动副本
         for vnode in &replica.vnodes {
             let raft_id = vnode.id as RaftNodeId;
             let info = RaftNodeInfo {
@@ -194,9 +216,14 @@ impl RaftNodesManager {
         }
 
         info!("init raft group: {:?}", replica);
+
+        // 先在集群中通知各raft节点启动  然后初始化raft集群
         raft_node.raft_init(cluster_nodes).await?;
+
+        // 等待leader选举结束
         self.try_wait_leader_elected(raft_node.clone()).await;
 
+        // 增加本manager维护的副本节点
         nodes.add_node(raft_node.clone());
 
         Ok(raft_node)
@@ -215,6 +242,7 @@ impl RaftNodesManager {
                     break;
                 }
             } else {
+                // 本节点就是leader
                 break;
             }
 
@@ -222,25 +250,30 @@ impl RaftNodesManager {
         }
     }
 
+    // 销毁整个副本组
     pub async fn destory_replica_group(
         &self,
         tenant: &str,
         db_name: &str,
         replica_id: ReplicationSetId,
     ) -> CoordinatorResult<()> {
+        // 获取副本集全信息
         let all_info = get_replica_all_info(self.meta.clone(), tenant, replica_id).await?;
         let replica = all_info.replica_set.clone();
+        // 只有leader节点可以发起 销毁副本组的请求
         if replica.leader_node_id != self.node_id() {
             return Err(CoordinatorError::LeaderIsWrong {
                 replica: replica.clone(),
             });
         }
 
+        // 本副本节点从 raft集群中离开
         let raft_node = self.get_node_or_build(tenant, db_name, &replica).await?;
         let mut members = BTreeSet::new();
         members.insert(raft_node.raft_id());
         raft_node.raft_change_membership(members).await?;
 
+        // 由leader通知其余节点从集群离开
         for vnode in replica.vnodes.iter() {
             if vnode.node_id == self.node_id() {
                 continue;
@@ -252,8 +285,10 @@ impl RaftNodesManager {
             info!("destory replica group drop vnode: {:?},{:?}", vnode, result);
         }
 
+        // 等待所有节点从raft集群离开时  终止集群
         raft_node.shutdown().await?;
 
+        // 将通知发往元数据服务
         update_replication_set(
             self.meta.clone(),
             tenant,
@@ -265,6 +300,7 @@ impl RaftNodesManager {
         )
         .await?;
 
+        // 删除本地数据
         let vnode_id = raft_node.raft_id() as VnodeId;
         if let Some(storage) = &self.kv_inst {
             let err = storage.remove_tsfamily(tenant, db_name, vnode_id).await;
@@ -275,16 +311,20 @@ impl RaftNodesManager {
         Ok(())
     }
 
+
+    // 代表往副本集中添加新成员
     pub async fn add_follower_to_group(
         &self,
         tenant: &str,
         db_name: &str,
-        follower_nid: NodeId,
+        follower_nid: NodeId,  // 期望成为副本的节点
         replica_id: ReplicationSetId,
     ) -> CoordinatorResult<()> {
         let follower_addr = self.meta.node_info_by_id(follower_nid).await?.grpc_addr;
         let all_info = get_replica_all_info(self.meta.clone(), tenant, replica_id).await?;
         let replica = all_info.replica_set.clone();
+
+        // 只有leader节点可以管理该请求
         if replica.leader_node_id != self.node_id() {
             return Err(CoordinatorError::LeaderIsWrong {
                 replica: replica.clone(),
@@ -293,6 +333,7 @@ impl RaftNodesManager {
 
         let raft_node = self.get_node_or_build(tenant, db_name, &replica).await?;
 
+        // retain_id 返回的是一个全局id  传入count1 代表递增1  得到一个新的id
         let new_vnode_id = self.meta.retain_id(1).await?;
         let new_vnode = VnodeInfo {
             id: new_vnode_id,
@@ -315,8 +356,10 @@ impl RaftNodesManager {
         for vnode in replica.vnodes.iter() {
             members.insert(vnode.id as RaftNodeId);
         }
+        // 更新集群节点
         raft_node.raft_change_membership(members).await?;
 
+        // 副本增加了节点 推送到元数据服务
         update_replication_set(
             self.meta.clone(),
             tenant,
@@ -331,6 +374,7 @@ impl RaftNodesManager {
         Ok(())
     }
 
+    // 某节点从副本集中离开
     pub async fn remove_node_from_group(
         &self,
         tenant: &str,
@@ -357,6 +401,7 @@ impl RaftNodesManager {
             let raft_node = self.get_node_or_build(tenant, db_name, &replica).await?;
             raft_node.raft_change_membership(members).await?;
 
+            // 通知远程下线 or 本地节点下线
             if vnode.node_id == self.node_id() {
                 self.exec_drop_raft_node(tenant, db_name, vnode.id, replica.id)
                     .await?;
@@ -365,6 +410,7 @@ impl RaftNodesManager {
                     .await?;
             }
 
+            // 更新副本集
             update_replication_set(
                 self.meta.clone(),
                 tenant,
@@ -395,30 +441,40 @@ impl RaftNodesManager {
         }
     }
 
+    // 启动指定的节点
     async fn open_raft_node(
         &self,
         tenant: &str,
         db_name: &str,
         vnode_id: VnodeId,
-        group_id: ReplicationSetId,
+        group_id: ReplicationSetId,   // 每个副本集 对应一个raft组 有点像kafka
     ) -> CoordinatorResult<Arc<RaftNode>> {
         info!("open local raft node: {}.{}", group_id, vnode_id);
 
+        // 该对象可以用于访问 vnode节点相关的wal数据文件
+        // 在该模块中 将wal文件作为  raft的日志存储
         let entry = self
             .raft_node_logs(tenant, db_name, vnode_id, group_id)
             .await?;
+
+        // 基于存储引擎 包装应用处理器
         let engine = self.raft_node_engine(tenant, db_name, vnode_id).await?;
 
+        // 开放grpc端口
         let grpc_addr = models::utils::build_address(
             self.config.host.clone(),
             self.config.cluster.grpc_listen_port,
         );
+
+        // 产生本节点信息
         let info = RaftNodeInfo {
             group_id,
             address: grpc_addr,
         };
 
         let raft_id = vnode_id as u64;
+
+        // 将各种信息组合起来 变成了NodeStorage 内部包含了raft协议需要的各个组件
         let storage = NodeStorage::open(
             raft_id,
             info.clone(),
@@ -427,8 +483,11 @@ impl RaftNodesManager {
             entry,
         )?;
         let storage = Arc::new(storage);
+
+        // 包装成node
         let node = RaftNode::new(raft_id, info, self.raft_config(), storage, engine).await?;
 
+        // 将相关信息包装成summary 通过 state统一管理
         let summary = RaftNodeSummary {
             raft_id,
             group_id,
@@ -441,25 +500,32 @@ impl RaftNodesManager {
         Ok(Arc::new(node))
     }
 
+    // 加载本地节点相关的wal日志
     async fn raft_node_logs(
         &self,
         tenant: &str,
         db_name: &str,
         vnode_id: VnodeId,
-        group_id: ReplicationSetId,
+        group_id: ReplicationSetId,  // 某个副本集id  也是一个raft group id
     ) -> CoordinatorResult<EntryStorageRef> {
+
+        // 生成一个key
         let owner = models::schema::make_owner(tenant, db_name);
+        // 根据当前数据节点的配置 生成wal opt
         let wal_option = tskv::kv_option::WalOptions::from(&self.config);
 
+        // 每个vnode节点会关联一个wal文件目录
         let wal = wal::VnodeWal::new(Arc::new(wal_option), Arc::new(owner), vnode_id).await?;
         let raft_logs = wal::raft_store::RaftEntryStorage::new(wal);
 
         let _apply_id = self.raft_state.get_last_applied_log(group_id)?;
+        // 主要是重建wal文件索引
         raft_logs.recover().await?;
 
         Ok(Arc::new(raft_logs))
     }
 
+    // 生成应用处理器 主要用于调用存储引擎的快照相关接口
     async fn raft_node_engine(
         &self,
         tenant: &str,
@@ -483,6 +549,7 @@ impl RaftNodesManager {
         Ok(engine)
     }
 
+    // 通知其他节点离开raft集群
     async fn drop_remote_raft_node(
         &self,
         tenant: &str,
@@ -511,6 +578,7 @@ impl RaftNodesManager {
         crate::status_response_to_result(&response)
     }
 
+    // 远程通知某个节点 开启副本节点
     async fn open_remote_raft_node(
         &self,
         tenant: &str,
@@ -526,6 +594,7 @@ impl RaftNodesManager {
         let channel = self.meta.get_node_conn(vnode.node_id).await?;
         let timeout_channel = Timeout::new(channel, Duration::from_secs(5));
         let mut client = TskvServiceClient::<Timeout<transport::Channel>>::new(timeout_channel);
+        // 发送请求
         let cmd = tonic::Request::new(OpenRaftNodeRequest {
             replica_id,
             vnode_id: vnode.id,

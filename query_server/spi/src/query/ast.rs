@@ -12,9 +12,10 @@ use models::meta_data::{NodeId, ReplicationSetId, VnodeId};
 use super::logical_planner::{DatabaseObjectType, GlobalObjectType, TenantObjectType};
 
 /// Statement representations
+/// 在解析sql时可能会出现的token
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtStatement {
-    /// ANSI SQL AST node
+    /// ANSI SQL AST node    内部包含sqlParser解析出来的会话
     SqlStatement(Box<Statement>),
 
     // bulk load/unload
@@ -92,6 +93,7 @@ pub struct DropVnode {
     pub vnode_id: VnodeId,
 }
 
+// 代表本次发起一个copy操作
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Copy {
     pub copy_target: CopyTarget,
@@ -99,12 +101,14 @@ pub struct Copy {
     pub copy_options: Vec<SqlOption>,
 }
 
+// 拷贝到另一张表 or 某个地方
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CopyTarget {
     IntoTable(CopyIntoTable),
     IntoLocation(CopyIntoLocation),
 }
 
+// 代表要被到某张表
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyIntoTable {
     pub location: UriLocation,

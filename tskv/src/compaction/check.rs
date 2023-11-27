@@ -24,6 +24,7 @@ const DEFAULT_DURATION: i64 = 24 * 60 * 60 * 1_000_000_000;
 
 pub type Hash = [u8; 32];
 
+// 将hash转换成字符串
 pub fn hash_to_string(hash: Hash) -> String {
     let mut s = String::with_capacity(32);
     for v in hash {
@@ -32,10 +33,14 @@ pub fn hash_to_string(hash: Hash) -> String {
     s
 }
 
+// 代表一个vnode  每个节点有关某个table的数据  抽象出来的是vnode 然后vnode又会关联多个series 每个series是一组tab匹配到的数据集合
+// 相同的数据列 通过不同tab划分成多个series
 #[derive(Default, Debug)]
 pub struct VnodeHashTreeNode {
     pub vnode_id: TseriesFamilyId,
-    pub fields: Vec<FieldHashTreeNode>,
+    pub fields: Vec<FieldHashTreeNode>,  // vnode节点下是一堆field节点
+
+    // 表示这些列数据的最小/最大时间戳
     min_ts: Timestamp,
     max_ts: Timestamp,
 }
@@ -50,6 +55,7 @@ impl VnodeHashTreeNode {
         }
     }
 
+    // 往树中添加某个列相关的数据
     pub fn push(&mut self, value: FieldHashTreeNode) {
         self.min_ts = self.min_ts.min(value.min_ts);
         self.max_ts = self.max_ts.max(value.max_ts);
@@ -81,10 +87,15 @@ impl Display for VnodeHashTreeNode {
     }
 }
 
+// 每列数据被抽象成node节点
 #[derive(Default, Debug)]
 pub struct FieldHashTreeNode {
+    // 对应的列
     pub field_id: FieldId,
+    // 该列 的数据又被分成多个时间范围
     pub time_ranges: Vec<TimeRangeHashTreeNode>,
+
+    // 该列数据的时间上下限
     min_ts: Timestamp,
     max_ts: Timestamp,
 }
@@ -99,6 +110,7 @@ impl FieldHashTreeNode {
         }
     }
 
+    // 追加一个时间范围的数据
     pub fn push(&mut self, value: TimeRangeHashTreeNode) {
         self.min_ts = self.min_ts.min(value.min_ts);
         self.max_ts = self.max_ts.max(value.max_ts);
@@ -138,6 +150,7 @@ impl Display for FieldHashTreeNode {
     }
 }
 
+// 对应某个时间范围的数据
 #[derive(Default, Debug)]
 pub struct TimeRangeHashTreeNode {
     pub min_ts: Timestamp,
@@ -173,6 +186,7 @@ impl Display for TimeRangeHashTreeNode {
     }
 }
 
+// 表示校验和字段对应的schema
 pub fn vnode_table_checksum_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         ArrowField::new("VNODE_ID", ArrowDataType::UInt32, false),
@@ -180,8 +194,11 @@ pub fn vnode_table_checksum_schema() -> SchemaRef {
     ]))
 }
 
+// 生成vnode的校验和数据 需要整个列族数据参与
 pub(crate) async fn vnode_checksum(vnode: Arc<RwLock<TseriesFamily>>) -> Result<RecordBatch> {
     let vnode_id = vnode.read().await.tf_id();
+
+    // 构建树
     let root_node = vnode_hash_tree(vnode).await?;
 
     let capacity = root_node.len();
@@ -228,26 +245,37 @@ pub(crate) async fn vnode_hash_tree(
         (vnode_rlock.version(), vnode_rlock.tf_id())
     };
     let mut readers: Vec<Arc<TsmReader>> = Vec::new();
+
+    // version中存放了 文件名
     let tsm_paths: Vec<&PathBuf> = version
         .levels_info()
         .iter()
         .flat_map(|l| l.files.iter().map(|f| f.file_path()))
         .collect();
+
+    // 产生读取底层字节数据的reader对象
     for p in tsm_paths {
         let r = version.get_tsm_reader(p).await?;
         readers.push(r);
     }
 
     // Build a compact iterator, read data, split by time range and then calculate hash.
+    // 该迭代器用于将数据合并
     let iter = CompactIterator::new(readers, MAX_DATA_BLOCK_SIZE as usize, true);
+
+    // 通过该方法 将每列的数据 按照时间范围产生hash值
     let mut fid_tr_hash_val_map: HashMap<FieldId, Vec<(TimeRange, Hash)>> =
         read_from_compact_iterator(iter, vnode_id, DEFAULT_DURATION).await?;
 
     let mut field_ids: Vec<FieldId> = fid_tr_hash_val_map.keys().cloned().collect();
     field_ids.sort();
+
+    // 根据fieldId  分配内存
     let mut vnode_hash_tree_node = VnodeHashTreeNode::with_capacity(vnode_id, field_ids.len());
     for fid in field_ids {
         let tr_hashes = fid_tr_hash_val_map.remove(&fid).unwrap();
+
+        // 遍历每个field下每个时间范围  并产生TimeRangeHashTreeNode
         let mut filed_hash_tree_node = FieldHashTreeNode::with_capacity(fid, tr_hashes.len());
         for (tr, hash) in tr_hashes {
             filed_hash_tree_node.push(TimeRangeHashTreeNode::new(tr, hash));
@@ -255,6 +283,7 @@ pub(crate) async fn vnode_hash_tree(
         vnode_hash_tree_node.push(filed_hash_tree_node);
     }
 
+    // 目前是一个空实现 返回一个空节点
     Ok(vnode_hash_tree_node)
 }
 
@@ -262,6 +291,7 @@ pub(crate) async fn vnode_hash_tree(
 /// and `split_time_range_nanosecs`.
 ///
 /// **NOTE**: `split_time_range_nanosecs` must not greater than `blk_min_ts_nanosecs`.
+/// TODO 测试用
 fn calc_block_partial_time_range(
     blk_min_ts_nanosecs: Timestamp,
     split_time_range_nanosecs: i64,
@@ -285,6 +315,7 @@ fn calc_block_partial_time_range(
     Ok((min_ts, min_ts + split_time_range_nanosecs))
 }
 
+// 找到时间戳对应的下标
 fn find_timestamp(timestamps: &[Timestamp], max_timestamp: Timestamp) -> usize {
     if max_timestamp != Timestamp::MIN {
         match timestamps.binary_search(&max_timestamp) {
@@ -356,6 +387,7 @@ fn hash_partial_datablock(
     }
 }
 
+// 这个方法目前是空的
 async fn read_from_compact_iterator(
     mut _iter: CompactIterator,
     _vnode_id: TseriesFamilyId,

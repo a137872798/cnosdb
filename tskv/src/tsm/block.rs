@@ -19,11 +19,15 @@ pub trait ByTimeRange {
     fn exclude(&mut self, time_range: &TimeRange);
 }
 
+
+// 存储列式数据使用的数据块
 #[derive(Debug, Clone)]
 pub enum DataBlock {
     U64 {
         ts: Vec<i64>,
+        // 同一列中每个数据占用一格
         val: Vec<u64>,
+        // 描述数据的编码方式
         enc: DataBlockEncoding,
     },
     I64 {
@@ -111,6 +115,8 @@ impl PartialEq for DataBlock {
 }
 
 impl DataBlock {
+
+    // 初始化一个数据块  相同类型 因为是列式存储
     pub fn new(size: usize, field_type: PhysicalDType) -> Self {
         match field_type {
             PhysicalDType::Unsigned => Self::U64 {
@@ -145,8 +151,10 @@ impl DataBlock {
     }
 
     /// Inserts new timestamp and value wrapped by `DataType` to this `DataBlock`.
+    /// 往数据块中
     pub fn insert(&mut self, data: DataType) {
         match data {
+            // 注意到只有类型匹配后 才会执行push
             DataType::Bool(ts_in, val_in) => {
                 if let Self::Bool { ts, val, .. } = self {
                     ts.push(ts_in);
@@ -186,6 +194,7 @@ impl DataBlock {
         }
     }
 
+    // 清空数据块
     pub fn clear(&mut self) {
         match self {
             DataBlock::U64 { ts, val, .. } => {
@@ -211,6 +220,7 @@ impl DataBlock {
         }
     }
 
+    // 拿到数据块 首条记录与最后一条记录的时间戳
     pub fn time_range(&self) -> Option<(Timestamp, Timestamp)> {
         if self.is_empty() {
             return None;
@@ -227,6 +237,7 @@ impl DataBlock {
 
     /// Returns (`timestamp[start]`, `timestamp[end]`) from this `DataBlock` at the specified
     /// indexes.
+    /// 读取指定偏移量的时间
     pub fn time_range_by_range(&self, start: usize, end: usize) -> (i64, i64) {
         match self {
             DataBlock::U64 { ts, .. } => (ts[start].to_owned(), ts[end - 1].to_owned()),
@@ -245,6 +256,7 @@ impl DataBlock {
     }
 
     /// Returns the encodings for timestamps and values of this `DataBlock`.
+    /// 返回使用的编码方式
     pub fn encodings(&self) -> DataBlockEncoding {
         match &self {
             Self::U64 { enc, .. } => *enc,
@@ -267,6 +279,7 @@ impl DataBlock {
     }
 
     /// Returns the `PhysicalDType` by this `DataBlock` variant.
+    /// 数据类型可以映射成 "物理数据类型"
     pub fn field_type(&self) -> PhysicalDType {
         match &self {
             DataBlock::U64 { .. } => PhysicalDType::Unsigned,
@@ -278,6 +291,7 @@ impl DataBlock {
     }
 
     /// Returns a slice containing the entire timestamps of this `DataBlock`.
+    /// 取出时间分片
     pub fn ts(&self) -> &[i64] {
         match self {
             DataBlock::U64 { ts, .. } => ts.as_slice(),
@@ -300,6 +314,7 @@ impl DataBlock {
     }
 
     /// Returns the (ts, val) wrapped by `DataType` at the index 'i'
+    /// 读取数据块中 指定下标的列
     pub fn get(&self, i: usize) -> Option<DataType> {
         match self {
             DataBlock::U64 { ts, val, .. } => {
@@ -341,6 +356,7 @@ impl DataBlock {
     }
 
     /// Set the (ts, val) wrapped by `DataType` at the index 'i'
+    /// 覆盖数据块某个下标对应的列值
     pub fn set(&mut self, i: usize, data_type: DataType) {
         match (self, data_type) {
             (DataBlock::U64 { ts, val, .. }, DataType::U64(ts_in, val_in)) => {
@@ -367,6 +383,7 @@ impl DataBlock {
         }
     }
 
+    // 设置编码方式
     pub fn set_encoding(&mut self, encoding: DataBlockEncoding) {
         match self {
             DataBlock::U64 { enc, .. } => {
@@ -387,6 +404,8 @@ impl DataBlock {
         }
     }
 
+    // 两两合并 就是挨个读取记录 并按照时间戳排序 也就是说同一level的多个数据文件 会存在时间交集的
+    // 数据写入估计是并发的  提升吞吐量 最大程度利用io
     pub fn merge(&self, other: Self) -> Self {
         let (mut i, mut j) = (0_usize, 0_usize);
         let len_1 = self.len();
@@ -437,6 +456,7 @@ impl DataBlock {
     /// Merges one or many `DataBlock`s into some `DataBlock` with fixed length,
     /// sorted by timestamp, if many (timestamp, value) conflict with the same
     /// timestamp, use the last value.
+    /// 将多个数据块进行合并
     pub fn merge_blocks(mut blocks: Vec<Self>, max_block_size: u32) -> Vec<Self> {
         if blocks.is_empty() {
             return vec![];
@@ -456,12 +476,18 @@ impl DataBlock {
 
         let mut res = vec![];
         let mut blk = Self::new(capacity, field_type);
+
+        // 读取每个block最近读取到的数据
         let mut buf = vec![None; blocks.len()];
+
+        // 记录每个block此时读取到的偏移量
         let mut offsets = vec![0_usize; blocks.len()];
         loop {
+            // 找到其中最小的时间序列 让我想到了最小堆?
             match Self::next_min(&mut blocks, &mut buf, &mut offsets) {
                 Some(min) => {
                     let mut data = None;
+                    // 取出对应的值
                     for item in &mut buf {
                         if let Some(it) = item {
                             if it.timestamp() == min {
@@ -470,13 +496,16 @@ impl DataBlock {
                         }
                     }
                     if let Some(it) = data {
+                        // 会触发vec的扩容操作 所以没问题
                         blk.insert(it);
+                        // 如果有限定每个block的大小 产生一个新的block
                         if max_block_size != 0 && blk.len() >= max_block_size as usize {
                             res.push(blk);
                             blk = Self::new(capacity, field_type);
                         }
                     }
                 }
+                // 已经读取完所有数据了
                 None => {
                     if !blk.is_empty() {
                         res.push(blk);
@@ -495,8 +524,11 @@ impl DataBlock {
         offsets: &mut [usize],
     ) -> Option<Timestamp> {
         let mut min_ts = None;
+
+        // 比较每个block最小的值 并返回更小的那个
         for (i, (block, dst)) in blocks.iter_mut().zip(dst).enumerate() {
             if dst.is_none() {
+                // 触发读取逻辑
                 *dst = block.get(offsets[i]);
                 offsets[i] += 1;
             }
@@ -514,6 +546,8 @@ impl DataBlock {
     /// and less than `max`.
     ///
     /// **Panics** if min or max is out of range of the ts or val in this `DataBlock`.
+    ///
+    /// 按照下标排除
     fn exclude_by_index(&mut self, min: usize, max: usize) {
         match self {
             DataBlock::U64 { ts, val, .. } => {
@@ -556,6 +590,7 @@ impl DataBlock {
             None => return self.clone(),
         };
 
+        // 将一个连续的时间范围 啃掉n个时间范围后 读取剩下的时间范围对应的数据 并重新组成一个DataBlock
         let indexs = time_ranges
             .exclude_time_ranges(exclude_time_ranges)
             .time_ranges()
@@ -633,6 +668,7 @@ impl DataBlock {
     }
 
     // left close, right open [min, max]
+    // 读取时间范围 在block中对应的列值下标
     pub fn index_range(&self, time_range: &TimeRange) -> Option<(usize, usize)> {
         if self.is_empty() {
             return None;
@@ -695,15 +731,20 @@ impl DataBlock {
     }
 
     /// Encodes timestamps and values of this `DataBlock` to bytes.
+    /// 对数据进行编码
     pub fn encode(
         &self,
         start: usize,
         end: usize,
         encodings: DataBlockEncoding,
     ) -> Result<(Vec<u8>, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+
+        // 得到时间戳和列值的编码方式
         let (ts_enc, val_enc) = encodings.split();
         let ts_codec = get_ts_codec(ts_enc);
 
+
+        // 将编码好的数据存入buf中
         let mut ts_buf = vec![];
         let mut data_buf = vec![];
         match self {
@@ -737,6 +778,7 @@ impl DataBlock {
         Ok((ts_buf, data_buf))
     }
 
+    // 上面的反向操作
     pub fn decode(
         ts: &[u8],
         val: &[u8],
@@ -894,6 +936,7 @@ impl Display for DataBlock {
     }
 }
 
+// 快速排除某些index
 fn exclude_fast<T: Sized + Copy>(v: &mut Vec<T>, min_idx: usize, max_idx: usize) {
     if v.is_empty() {
         return;
@@ -904,6 +947,7 @@ fn exclude_fast<T: Sized + Copy>(v: &mut Vec<T>, min_idx: usize, max_idx: usize)
     }
     let a = v.as_mut_ptr();
     // SAFETY: min_idx and max_idx must not out of the bounds of v
+    // 使用unsafe操作
     unsafe {
         assert!(min_idx <= v.len());
         assert!(max_idx <= v.len());
@@ -914,6 +958,7 @@ fn exclude_fast<T: Sized + Copy>(v: &mut Vec<T>, min_idx: usize, max_idx: usize)
     }
 }
 
+// 通过正常的数据拷贝
 fn exclude_slow(v: &mut Vec<MiniVec<u8>>, min_idx: usize, max_idx: usize) {
     if min_idx == max_idx {
         v.remove(min_idx);
@@ -925,10 +970,13 @@ fn exclude_slow(v: &mut Vec<MiniVec<u8>>, min_idx: usize, max_idx: usize) {
     v.truncate(len);
 }
 
+// 通过该对象读取数据块
 pub struct DataBlockReader {
     data_block: DataBlock,
-    idx: usize,
+    idx: usize,  // 默认为MAX
     end_idx: usize,
+
+    // reader对象可以设置时间范围  这样就只能读取到范围内的数据
     intersected_time_ranges: TimeRanges,
     intersected_time_ranges_i: usize,
 }
@@ -981,6 +1029,8 @@ impl DataBlockReader {
             intersected_time_ranges: time_ranges,
             intersected_time_ranges_i: 0,
         };
+
+        // 根据当前使用的时间范围  确定在数据块的下标
         if res.set_index_from_time_ranges() {
             res
         } else {
@@ -994,17 +1044,25 @@ impl DataBlockReader {
     ///
     /// If there are overlaped time range of DataBlock and TimeRanges, set iteration range of `data_block`
     /// and return true, otherwise set the iteration range a zero-length range `[1, 0]` and return false.
+    /// 根据时间范围设置index
     fn set_index_from_time_ranges(&mut self) -> bool {
+
+        // 代表时间范围不够用
         if self.intersected_time_ranges.is_empty()
             || self.intersected_time_ranges_i >= self.intersected_time_ranges.len()
         {
             false
         } else {
+
+            // 通过下标判断使用哪些范围
             let tr_idx_start = self.intersected_time_ranges_i;
+
+            // 这后面的范围都会使用
             for tr in self.intersected_time_ranges.time_ranges()[tr_idx_start..].iter() {
                 self.intersected_time_ranges_i += 1;
                 // Check if the DataBlock matches one of the intersected time ranges.
                 // TODO: sometimes the comparison in loop can stop earily.
+                // 代表当前使用这组时间范围  并得到范围在数据块中的下标
                 if let Some((min, max)) = self.data_block.index_range(tr) {
                     self.idx = min;
                     self.end_idx = max;
@@ -1025,6 +1083,7 @@ impl DataBlockReader {
 impl Iterator for DataBlockReader {
     type Item = DataType;
     fn next(&mut self) -> Option<Self::Item> {
+        // 代表该时间范围内的已经读取完了 切换到下一个范围
         if self.idx > self.end_idx && !self.set_index_from_time_ranges() {
             return None;
         }
@@ -1034,13 +1093,18 @@ impl Iterator for DataBlockReader {
     }
 }
 
+// 表示一个被编码后的数据块
 #[derive(Debug, Clone)]
 pub struct EncodedDataBlock {
+    // 存储编码后的时间戳和 value
     pub ts: Vec<u8>,
     pub val: Vec<u8>,
+    // 描述编码方式
     pub enc: DataBlockEncoding,
     pub count: u32,
+    // 表示编码后的物理类型
     pub field_type: PhysicalDType,
+    // 该数据块的时间范围
     pub time_range: Option<TimeRange>,
 }
 

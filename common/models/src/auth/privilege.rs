@@ -5,15 +5,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::oid::Id;
 
+// A权限检查B权限
 pub trait PrivilegeChecker {
     fn check_privilege(&self, other: &Self) -> bool;
 }
 
+// 表示一个特权
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Privilege<T> {
+
+    // 表示一个全局特权  可能被赋予某个用户或者租户
     Global(GlobalPrivilege<T>),
     // Some(T): tenantId
     // None: all tenants
+    // 表示一个租户级别的权限  T为None 代表针对所有租户
     TenantObject(TenantObjectPrivilege, Option<T>),
 }
 
@@ -51,11 +56,15 @@ impl<T: Id> PrivilegeChecker for Privilege<T> {
     }
 }
 
+// 全局权限 代表的是更高维度的权限   (下面的要么是针对租户概念的权限 或者数据库级别的权限)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum GlobalPrivilege<T> {
+
+    // 全局范围的权限 且与系统相关
     System,
     // Some(T): Administrative rights for the specify user, `T` represents the unique identifier of the user
     // None: Administrative rights for all user
+    // 全局范围的权限 且与某个用户相关
     User(Option<T>),
     // Some(T): Administrative rights for the specify tenant, `T` represents the unique identifier of the tenant
     // None: Administrative rights for all tenants
@@ -106,17 +115,18 @@ where
     }
 }
 
+// 描述一个租户级别的特权
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TenantObjectPrivilege {
-    // All operation permissions related to system
+    // All operation permissions related to system   代表这个权限是有关发起系统操作的
     // e.g. kill querys of tenant
     System,
-    // All operation permissions related to members
+    // All operation permissions related to members  代表这个权限是用于管理租户下所有用户的
     MemberFull,
-    // All operation permissions related to roles
+    // All operation permissions related to roles    代表这个权限是用于管理租户下所有角色的
     RoleFull,
     // T: database_name
-    // None: all databases in this tenant
+    // None: all databases in this tenant   代表这个权限是有关读写db的
     Database(DatabasePrivilege, Option<String>),
 }
 
@@ -144,6 +154,7 @@ impl Display for TenantObjectPrivilege {
     }
 }
 
+// 基于租户级别 检查是否具有这个权限 (当前权限是否覆盖另一个权限)
 impl PrivilegeChecker for TenantObjectPrivilege {
     fn check_privilege(&self, other: &Self) -> bool {
         match (self, other) {
@@ -159,6 +170,7 @@ impl PrivilegeChecker for TenantObjectPrivilege {
     }
 }
 
+// 数据库级别的特权
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DatabasePrivilege {
     Read,
@@ -176,6 +188,7 @@ impl DatabasePrivilege {
     }
 }
 
+// 检验当前权限是否覆盖另一个权限
 impl PrivilegeChecker for DatabasePrivilege {
     fn check_privilege(&self, other: &Self) -> bool {
         match (self, other) {

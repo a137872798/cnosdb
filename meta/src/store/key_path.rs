@@ -28,6 +28,7 @@ pub const RESOURCE_INFOS_MARK: &str = "resourceinfosmark";
 
 pub struct KeyPath {}
 
+// 包含了一些产生path的api
 impl KeyPath {
     pub fn cluster_prefix(cluster: &str) -> String {
         format!("/{}/", cluster)

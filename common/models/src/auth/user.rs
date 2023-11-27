@@ -120,6 +120,7 @@ impl Identifier<Oid> for UserDesc {
     }
 }
 
+// 创建用户时 使用到的配置
 #[derive(Debug, Default, Clone, Builder, Serialize, Deserialize)]
 #[builder(setter(into, strip_option), default, build_fn(name = "final_build"))]
 pub struct UserOptions {
@@ -130,7 +131,7 @@ pub struct UserOptions {
     rsa_public_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     comment: Option<String>,
-    #[builder(default = "Some(false)")]
+    #[builder(default = "Some(false)")]  // 是否授予管理员权限
     granted_admin: Option<bool>,
 }
 

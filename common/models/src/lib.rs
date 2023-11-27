@@ -37,6 +37,8 @@ pub type CatalogId = u64;
 pub type SchemaId = u64;
 pub type SeriesId = u32;
 pub type TableId = u64;
+
+// 定位到某个列的id
 pub type ColumnId = u32;
 
 pub type TagKey = Vec<u8>;

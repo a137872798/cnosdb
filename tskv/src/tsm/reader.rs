@@ -48,9 +48,12 @@ pub enum ReadTsmError {
 }
 
 /// Disk-based index reader
+/// 该对象用于读取索引数据
 pub struct IndexFile {
     reader: Arc<AsyncFile>,
     bloom_filter: BloomFilter,
+
+    // 存储读取到的索引数据
     idx_meta_buf: [u8; INDEX_META_SIZE],
     blk_meta_buf: [u8; BLOCK_META_SIZE],
 
@@ -69,6 +72,7 @@ impl IndexFile {
             .read_at(file_len - FOOTER_SIZE as u64, &mut footer)
             .await
             .context(ReadIOSnafu)?;
+        // footer中记录了布隆过滤器的数据
         let bloom_filter = BloomFilter::with_data(&footer[..BLOOM_FILTER_SIZE]);
         let index_offset = decode_be_u64(&footer[BLOOM_FILTER_SIZE..]);
         Ok(Self {
@@ -86,6 +90,7 @@ impl IndexFile {
 
     // TODO: not implemented
     pub(crate) async fn next_index_entry(&mut self) -> ReadTsmResult<Option<IndexEntry>> {
+        // 代表无数据可读
         if self.pos >= self.end_pos {
             return Ok(None);
         }
@@ -93,8 +98,12 @@ impl IndexFile {
             .read_at(self.pos, &mut self.idx_meta_buf[..])
             .await
             .context(ReadIOSnafu)?;
+        // 推进偏移量
         self.pos += INDEX_META_SIZE as u64;
+        // 解析得到该索引数据 以及下面的block信息
         let (entry, blk_count) = IndexEntry::decode(&self.idx_meta_buf);
+
+        // 解开了一个新的index 要更新block信息
         self.index_block_idx = 0;
         self.index_block_count = blk_count as usize;
 
@@ -102,6 +111,7 @@ impl IndexFile {
     }
 
     // TODO: not implemented
+    // 读取下一个block数据
     pub(crate) async fn next_block_entry(&mut self) -> ReadTsmResult<Option<BlockEntry>> {
         if self.index_block_idx >= self.index_block_count {
             return Ok(None);
@@ -175,6 +185,7 @@ pub async fn print_tsm_statistics(path: impl AsRef<Path>, show_tombstone: bool) 
     println!("PointsCount: {}", points_cnt);
 }
 
+// 加载索引文件的数据
 pub async fn load_index(tsm_file_id: u64, reader: Arc<AsyncFile>) -> ReadTsmResult<Index> {
     let len = reader.len();
     if len < FOOTER_SIZE as u64 {
@@ -192,6 +203,7 @@ pub async fn load_index(tsm_file_id: u64, reader: Arc<AsyncFile>) -> ReadTsmResu
         .read_at(len - FOOTER_SIZE as u64, &mut buf)
         .await
         .context(ReadIOSnafu)?;
+    // 从footer还原 布隆过滤器数据和offset
     let bloom_filter = BloomFilter::with_data(&buf[..BLOOM_FILTER_SIZE]);
     let offset = decode_be_u64(&buf[BLOOM_FILTER_SIZE..]);
     if offset > len - FOOTER_SIZE as u64 {
@@ -204,6 +216,7 @@ pub async fn load_index(tsm_file_id: u64, reader: Arc<AsyncFile>) -> ReadTsmResu
     }
     let data_len = (len - offset - FOOTER_SIZE as u64) as usize;
     // TODO if data_len is too big, read data part in parts and do not store it.
+    // 打算一次性读取全部索引数据
     let mut data = vec![0_u8; data_len];
     // Read index data
     reader
@@ -213,8 +226,11 @@ pub async fn load_index(tsm_file_id: u64, reader: Arc<AsyncFile>) -> ReadTsmResu
 
     // Decode index data
     let assumed_field_count = (data_len / (INDEX_META_SIZE + BLOCK_META_SIZE)) + 1;
+
+    // 推测有多少field
     let mut field_id_offs: Vec<(FieldId, usize)> = Vec::with_capacity(assumed_field_count);
     let mut pos = 0_usize;
+    // 把每个field的起始偏移量存入field_id_offs
     while pos < data_len {
         field_id_offs.push((decode_be_u64(&data[pos..pos + 8]), pos));
         pos += INDEX_META_SIZE + BLOCK_META_SIZE * decode_be_u16(&data[pos + 9..pos + 11]) as usize;
@@ -233,6 +249,7 @@ pub async fn load_index(tsm_file_id: u64, reader: Arc<AsyncFile>) -> ReadTsmResu
 }
 
 /// Memory-based index reader
+/// 通过该对象读取数据文件 并还原出Index
 pub struct IndexReader {
     index_ref: Arc<Index>,
 }
@@ -257,6 +274,7 @@ impl IndexReader {
     }
 
     /// Create `IndexIterator` by filter options
+    /// 生成只读取某个field的迭代器
     pub fn iter_opt(&self, field_id: FieldId) -> IndexIterator {
         if let Ok(idx) = self
             .index_ref
@@ -272,12 +290,12 @@ impl IndexReader {
 
 pub struct IndexIterator {
     index_ref: Arc<Index>,
-    /// Array index in `Index::offsets`.
+    /// Array index in `Index::offsets`.  当前读取到的field相关索引数据的起始偏移量
     index_idx: usize,
     block_count: usize,
     block_type: ValueType,
 
-    /// The max number of iterations
+    /// The max number of iterations   代表总计有多少field
     index_meta_limit: usize,
     /// The current iteration number.
     index_meta_idx: usize,
@@ -300,6 +318,7 @@ impl Iterator for IndexIterator {
     type Item = IndexMeta;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // 读取下一个field数据
         if self.index_meta_idx >= self.index_meta_limit {
             return None;
         }
@@ -307,7 +326,7 @@ impl Iterator for IndexIterator {
 
         let ret = Some(get_index_meta_unchecked(
             self.index_ref.clone(),
-            self.index_idx,
+            self.index_idx,  // 从该偏移量开始读取
         ));
         self.index_idx += 1;
         ret
@@ -315,6 +334,7 @@ impl Iterator for IndexIterator {
 }
 
 /// Iterates `BlockMeta`s in Index of a file.
+/// IndexMeta是针对field级别  Block是针对field的数据块级别
 pub struct BlockMetaIterator {
     index_ref: Arc<Index>,
     /// Array index in `Index::offsets`
@@ -325,6 +345,8 @@ pub struct BlockMetaIterator {
     block_offset: usize,
     /// Number of `BlockMeta` in current `IndexMeta`
     block_count: u16,
+
+    // 通过时间范围增加了限制
     time_ranges: Option<Arc<TimeRanges>>,
 
     /// The current iteration number.
@@ -335,7 +357,7 @@ pub struct BlockMetaIterator {
 
 impl BlockMetaIterator {
     pub fn new(
-        index: Arc<Index>,
+        index: Arc<Index>,   // 初始化参数都是有关index的描述
         index_offset: usize,
         field_id: FieldId,
         field_type: ValueType,
@@ -355,6 +377,7 @@ impl BlockMetaIterator {
     }
 
     /// Set iterator start & end position by time range
+    /// 给迭代器 附加一个时间范围  只会返回范围内的数据
     pub(crate) fn filter_time_range(&mut self, time_ranges: Arc<TimeRanges>) {
         if time_ranges.is_boundless() {
             self.time_ranges = Some(time_ranges);
@@ -366,17 +389,22 @@ impl BlockMetaIterator {
 
         self.time_ranges = Some(time_ranges);
         let base = self.index_offset + INDEX_META_SIZE;
+
+        // 读取所有block索引数据
         let sli = &self.index_ref.data()[base..base + self.block_count as usize * BLOCK_META_SIZE];
         let mut pos = 0_usize;
         let mut idx = 0_usize;
         // Find `idx` of index blocks that time_range.min_ts <= block.max_ts .
+        // 根据时间范围 过滤掉block数据
         while pos < sli.len() {
+            // 需要被过滤
             if min_ts > decode_be_i64(&sli[pos + 8..pos + 16]) {
                 // If time_range.min_ts > block.max_ts, go on to check next block.
                 pos += BLOCK_META_SIZE;
                 idx += 1;
             } else {
                 // If time_range.min_ts <= block.max_ts, This block may be the start block.
+                // 更新有效的block起始偏移量
                 self.block_offset = pos;
                 break;
             }
@@ -389,6 +417,7 @@ impl BlockMetaIterator {
         }
 
         // Find idx of index blocks that block.min_ts <= time_range.max_ts >= block.max_ts .
+        // 过滤另一半数据
         while pos < sli.len() {
             if max_ts < decode_be_i64(&sli[pos..pos + 8]) {
                 // If time_range.max_ts < block.min_ts, previous block is the end block.
@@ -406,9 +435,12 @@ impl BlockMetaIterator {
     }
 }
 
+
+// 实现迭代器接口
 impl Iterator for BlockMetaIterator {
     type Item = BlockMeta;
 
+    // 每次遍历下个block数据
     fn next(&mut self) -> Option<Self::Item> {
         if self.block_meta_idx >= self.block_meta_idx_end {
             return None;
@@ -425,12 +457,15 @@ impl Iterator for BlockMetaIterator {
                 );
                 self.block_meta_idx += 1;
                 self.block_offset += BLOCK_META_SIZE;
+
+                // 要确保有时间交集 因为上面按照时间范围过滤时 只是简单排开min/max外的数据 实际上有可能范围内的空洞中有block数据
                 if time_ranges.overlaps(&(block_meta.min_ts(), block_meta.max_ts()).into()) {
                     ret = Some(block_meta);
                     break;
                 }
             }
         } else {
+            // 没有时间范围限制 直接返回就好
             let block_meta = get_data_block_meta_unchecked(
                 self.index_ref.clone(),
                 self.index_offset,
@@ -447,11 +482,14 @@ impl Iterator for BlockMetaIterator {
     }
 }
 
+// 该对象读取数据文件
 #[derive(Clone)]
 pub struct TsmReader {
     tsm_file_id: u64,
     reader: Arc<AsyncFile>,
+    // 数据文件要配合索引使用
     index_reader: Arc<IndexReader>,
+    // 写入数据文件时不需要考虑坟墓数据 在读取时需要参考坟墓数据 在时间范围内的数据被认为是废弃的
     tombstone: Arc<TsmTombstone>,
 }
 
@@ -471,6 +509,7 @@ impl TsmReader {
         })
     }
 
+    // 通过该对象遍历索引数据
     pub fn index_iterator(&self) -> IndexIterator {
         self.index_reader.iter()
     }
@@ -480,9 +519,11 @@ impl TsmReader {
     }
 
     /// Returns a DataBlock without tombstone
+    /// 根据索引数据 从数据文件中还原数据块
     pub async fn get_data_block(&self, block_meta: &BlockMeta) -> ReadTsmResult<DataBlock> {
         let _blk_range = (block_meta.min_ts(), block_meta.max_ts());
         let mut buf = vec![0_u8; block_meta.size() as usize];
+        // 读取数据块
         let mut blk = read_data_block(
             self.reader.clone(),
             &mut buf,
@@ -491,12 +532,15 @@ impl TsmReader {
             block_meta.val_off(),
         )
         .await?;
+
+        // 过滤掉被标记成坟墓数据的部分
         self.tombstone
             .data_block_exclude_tombstones(block_meta.field_id(), &mut blk);
         Ok(blk)
     }
 
     // Reads raw data from file and returns the read data size.
+    // 根据block索引数据的提示 从数据文件中读取block
     pub async fn get_raw_data(
         &self,
         block_meta: &BlockMeta,
@@ -519,6 +563,7 @@ impl TsmReader {
 
     /// Returns all tombstone `TimeRange`s for a `BlockMeta`.
     /// Returns None if there is nothing to return, or `TimeRange`s is empty.
+    /// 获取与该block有交集的坟墓数据
     pub fn get_block_tombstone_time_ranges(
         &self,
         block_meta: &BlockMeta,
@@ -537,6 +582,7 @@ impl TsmReader {
         self.tombstone.get_cloned_time_ranges(field_id)
     }
 
+    // 添加一块坟墓数据
     pub async fn add_tombstone(&self, field_ids: &[FieldId], time_range: &TimeRange) -> Result<()> {
         self.tombstone
             .add_range(field_ids, time_range, Some(self.bloom_filter()))
@@ -568,6 +614,7 @@ pub struct ColumnReader {
     buf: Vec<u8>,
 }
 
+// TsmReader是整个数据文件 ColumnReader针对某列
 impl ColumnReader {
     pub fn new(reader: Arc<AsyncFile>, inner: BlockMetaIterator) -> Self {
         Self {
@@ -580,6 +627,8 @@ impl ColumnReader {
     async fn decode(&mut self, block_meta: &BlockMeta) -> ReadTsmResult<DataBlock> {
         let (_offset, size) = (block_meta.offset(), block_meta.size());
         self.buf.resize(size as usize, 0);
+
+        // 根据blockMeta信息 读取block数据 注意同时还会进行解码
         read_data_block(
             self.reader.clone(),
             &mut self.buf,
@@ -612,6 +661,7 @@ async fn read_data_block(
     decode_data_block(buf, field_type, val_off - offset)
 }
 
+// 数据解码
 pub fn decode_data_block(
     buf: &[u8],
     field_type: ValueType,
@@ -624,6 +674,7 @@ pub fn decode_data_block(
         });
     }
 
+    // 校验crc过程
     if byte_utils::decode_be_u32(&buf[..4]) != crc32fast::hash(&buf[4..val_off as usize]) {
         return Err(ReadTsmError::CrcCheck);
     }

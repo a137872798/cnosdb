@@ -36,6 +36,7 @@ impl Header {
         self.accept.as_deref().unwrap_or(APPLICATION_CSV)
     }
 
+    // 对认证头进行校验
     pub fn try_get_basic_auth(&self) -> Result<UserInfo, HttpError> {
         let private_key = self
             .private_key
@@ -68,8 +69,10 @@ impl Header {
             return get_err();
         }
 
+        // 去掉  Basic 前缀
         let content_in_auth = &auth[BASIC_PREFIX.len()..];
 
+        // 通过base64解码 得到用户名密码 同时还有私钥信息
         if let Ok(content) = base64::decode(content_in_auth) {
             if let Ok(str) = String::from_utf8(content) {
                 if let Some(idx) = str.find(':') {

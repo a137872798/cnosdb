@@ -33,16 +33,23 @@ pub type FlatBufferTable<'a> = flatbuffers::Vector<'a, flatbuffers::ForwardsUOff
 
 #[derive(Debug)]
 pub struct Database {
-    //tenant_name.database_name => owner
+    //tenant_name.database_name => owner       owner中包含了租户和数据库名
     owner: Arc<String>,
+    // 存储各种选项信息
     opt: Arc<Options>,
 
+    // 数据库的schema信息
     schemas: Arc<DBschemas>,
+    // 每个列族维护一个索引对象  同一个列族下 有很多seriesKey
     ts_indexes: HashMap<TseriesFamilyId, Arc<index::ts_index::TSIndex>>,
+
+    // 维护每个系列的数据
     ts_families: HashMap<TseriesFamilyId, Arc<RwLock<TseriesFamily>>>,
+    // 通过该对象可以在db中生成新的列族
     tsf_factory: TsfFactory,
 }
 
+// 用于生成db  注意需要与MetaServer交互
 #[derive(Debug)]
 pub struct DatabaseFactory {
     meta: MetaRef,
@@ -97,6 +104,7 @@ impl Database {
         let db = Self {
             opt,
             owner: Arc::new(schema.owner()),
+            // 这里会间接通过元数据服务在tenant下创建db
             schemas: Arc::new(DBschemas::new(schema, meta).await.context(SchemaSnafu)?),
             ts_indexes: HashMap::new(),
             ts_families: HashMap::new(),
@@ -106,6 +114,7 @@ impl Database {
         Ok(db)
     }
 
+    // 打开一个新的列族 一般在打开一个db后 会立即调用该方法
     pub fn open_tsfamily(
         &mut self,
         runtime: Arc<Runtime>,
@@ -114,9 +123,12 @@ impl Database {
         compact_task_sender: Sender<CompactTask>,
     ) {
         let tf_id = ver.tf_id();
+
+        // 产生列族
         let tf =
             self.tsf_factory
                 .create_tsf(tf_id, ver.clone(), flush_task_sender, compact_task_sender);
+        // 生成后台任务  定时检查是否需要合并数据
         tf.schedule_compaction(runtime);
         self.ts_families
             .insert(ver.tf_id(), Arc::new(RwLock::new(tf)));
@@ -127,7 +139,7 @@ impl Database {
     pub async fn add_tsfamily(
         &mut self,
         tsf_id: TseriesFamilyId,
-        version_edit: Option<VersionEdit>,
+        version_edit: Option<VersionEdit>,  // edit需要作用到列族上
         summary_task_sender: Sender<SummaryTask>,
         flush_task_sender: Sender<FlushReq>,
         compact_task_sender: Sender<CompactTask>,
@@ -136,10 +148,13 @@ impl Database {
         let new_version_edit_seq_no = 0;
         let (seq_no, version_edits, file_metas) = match version_edit {
             Some(mut ve) => {
+                // 把原来的数据文件 原封不动的移动到另一个目录 (还有修改文件名)
                 ve.tsf_id = tsf_id;
                 ve.has_seq_no = true;
                 ve.seq_no = new_version_edit_seq_no;
                 let mut file_metas = HashMap::with_capacity(ve.add_files.len());
+
+                // 这些文件内都是有数据的 所以直接产生reader对象
                 for f in ve.add_files.iter_mut() {
                     let new_file_id = global_ctx.file_id_next();
                     f.tsf_id = tsf_id;
@@ -168,6 +183,7 @@ impl Database {
                 (ve.seq_no, vec![ve], Some(file_metas))
             }
             None => (
+                // 代表添加一个空的列族
                 new_version_edit_seq_no,
                 vec![VersionEdit::new_add_vnode(
                     tsf_id,
@@ -204,6 +220,7 @@ impl Database {
         self.ts_families.insert(tsf_id, tf.clone());
 
         let (task_state_sender, _task_state_receiver) = oneshot::channel();
+        // 生成 SummaryTask 发送到下游
         let task = SummaryTask::new(version_edits, file_metas, None, task_state_sender);
         if let Err(e) = summary_task_sender.send(task).await {
             error!("failed to send Summary task, {:?}", e);
@@ -212,20 +229,26 @@ impl Database {
         Ok(tf)
     }
 
+    // 删除某个列族数据
     pub async fn del_tsfamily(&mut self, tf_id: u32, summary_task_sender: Sender<SummaryTask>) {
         if let Some(tf) = self.ts_families.remove(&tf_id) {
             tf.read().await.close();
         }
 
         // TODO(zipper): If no ts_family recovered from summary, do not write summary.
+        // 该列族被删除时  生成一个删除节点的edit
         let edits = vec![VersionEdit::new_del_vnode(tf_id)];
         let (task_state_sender, _task_state_receiver) = oneshot::channel();
+
+        // 包装成task对象
         let task = SummaryTask::new(edits, None, None, task_state_sender);
+        // 发送到下游
         if let Err(e) = summary_task_sender.send(task).await {
             error!("failed to send Summary task, {:?}", e);
         }
     }
 
+    // 在内存中重建行组数据    注意key是 seriesId + schemaId 也就是每当schema发生变化 之后的行会被分到不同的组
     pub async fn build_write_group(
         &self,
         db_name: &str,
@@ -249,33 +272,40 @@ impl Database {
         }
     }
 
+    // 基于严格写入模式
     pub async fn build_write_group_strict_mode(
         &self,
         precision: Precision,
-        tables: FlatBufferTable<'_>,
-        ts_index: Arc<index::ts_index::TSIndex>,
+        tables: FlatBufferTable<'_>,  // 其实是wal的数据
+        ts_index: Arc<index::ts_index::TSIndex>,  // 存储各种索引数据
         recover_from_wal: bool,
     ) -> Result<HashMap<(SeriesId, SchemaId), RowGroup>> {
         // (series id, schema id) -> RowGroup
         let mut map = HashMap::new();
         for table in tables {
+
+            // 每个table相关的数据
             let table_name = table.tab_ext()?;
+            // 这里存储了列信息
             let columns = table.columns().ok_or(Error::CommonError {
                 reason: "table missing columns".to_string(),
             })?;
             let fb_schema = FbSchema::from_fb_column(columns)?;
             let num_rows = table.num_rows() as usize;
+
+            // 返回每行数据对应的seriesId
             let sids = Self::build_index(
                 table_name,
                 &columns,
                 &fb_schema.tag_indexes,
-                num_rows,
+                num_rows,  // 要加载所有行
                 ts_index.clone(),
                 recover_from_wal,
             )
             .await?;
 
             for i in 0..num_rows {
+                // 构建行数据 填充到map中
                 self.build_row_data(
                     &mut map,
                     table_name,
@@ -293,6 +323,7 @@ impl Database {
         Ok(map)
     }
 
+    // 基于宽松模式 生成行组
     pub async fn build_write_group_loose_mode(
         &self,
         db_name: &str,
@@ -307,7 +338,10 @@ impl Database {
             let columns = table.columns().ok_or(Error::CommonError {
                 reason: "table missing columns".to_string(),
             })?;
+
+            // 将列信息填充到schema中
             let fb_schema = FbSchema::from_fb_column(columns)?;
+            // 行数
             let num_rows = table.num_rows() as usize;
             let sids = Self::build_index(
                 table_name,
@@ -320,7 +354,11 @@ impl Database {
             .await?;
 
             for i in 0..num_rows {
+
+                // 跟严格模式的区别在这里
                 let mut schema_change_or_create = false;
+
+                // 发现此时schema 与 table中数据描述的schema已经不匹配了   需要更新schema
                 if self
                     .schemas
                     .check_field_type_from_cache(
@@ -331,6 +369,7 @@ impl Database {
                     )
                     .is_err()
                 {
+                    // 代表创建/更新了schema
                     schema_change_or_create = self
                         .schemas
                         .check_field_type_or_else_add(
@@ -359,19 +398,23 @@ impl Database {
         Ok(map)
     }
 
+    // 填充行数据
     async fn build_row_data(
         &self,
         map: &mut HashMap<(SeriesId, SchemaId), RowGroup>,
         table_name: &str,
         precision: Precision,
         columns: &Vector<'_, ForwardsUOffset<Column<'_>>>,
-        fields_idx: &[usize],
+        fields_idx: &[usize],  // 本次要读取的列
         ts_idx: usize,
         row_count: usize,
-        sids: &[u32],
-        schema_change_or_create: bool,
+        sids: &[u32],  // 描述每行数据对应的seriesId  每行数据 根据标签列的不同组合 会对应不同的系列id
+        schema_change_or_create: bool, // 代表更新了schema
     ) -> Result<()> {
+
+        // 找到表当前schema
         let table_schema = if schema_change_or_create {
+            // 从元数据服务加载 确保schema是最新的
             self.schemas.get_table_schema_by_meta(table_name).await?
         } else {
             self.schemas.get_table_schema(table_name)?
@@ -381,6 +424,7 @@ impl Database {
             None => return Ok(()),
         };
 
+        // 读取到了该行数据
         let row = RowData::point_to_row_data(
             &table_schema,
             precision,
@@ -389,8 +433,11 @@ impl Database {
             ts_idx,
             row_count,
         )?;
+
+        // 看来也是维护多版本的schema  因为schema在接收上层请求后可能会改变
         let schema_size = table_schema.size();
         let schema_id = table_schema.schema_id;
+        // seriesId + schemaId 对应行组的key
         let entry = map.entry((sids[row_count], schema_id)).or_insert(RowGroup {
             schema: Arc::new(TskvTableSchema::default()),
             rows: LinkedList::new(),
@@ -411,27 +458,34 @@ impl Database {
         Ok(())
     }
 
+    // 该方法的目的 就是为了获取每行记录的 seriesId   不同的标签值 会对应不同的key 这个key可能就对应不同的seriesId
+    // 在这个过程中 会顺便将新的组合设置到index中
     async fn build_index(
         tab_name: &str,
         columns: &Vector<'_, ForwardsUOffset<Column<'_>>>,
         tag_idx: &[usize],
-        row_num: usize,
+        row_num: usize,  // 代表要加载多少行数据
         ts_index: Arc<index::ts_index::TSIndex>,
         recover_from_wal: bool,
     ) -> Result<Vec<u32>> {
         let mut res_sids = Vec::with_capacity(row_num);
         let mut series_keys = Vec::with_capacity(row_num);
+
         for row_count in 0..row_num {
+            // 读取标签列 重新产生seriesKey
             let series_key = SeriesKey::build_series_key(tab_name, columns, tag_idx, row_count)
                 .map_err(|e| Error::CommonError {
                     reason: e.to_string(),
                 })?;
+
+            // 如果找到了 seriesId 就加入到res_sids中 并进入下轮 否则记录seriesKey
             if let Some(id) = ts_index.get_series_id(&series_key).await? {
                 res_sids.push(Some(id));
                 continue;
             }
 
             if recover_from_wal {
+                // 找到标记为删除的seriesId
                 if let Some(id) = ts_index.get_deleted_series_id(&series_key).await? {
                     // 仅在 recover wal的时候有用
                     res_sids.push(Some(id));
@@ -439,14 +493,18 @@ impl Database {
                 }
             }
 
+            // 代表该key还没有关联seriesId  比如发现了一种新的组合
             res_sids.push(None);
             series_keys.push(series_key);
         }
 
+        // 建立 seriesKey 和 seriesId 的正反向索引关系   之前未出现过的key 会关联新的id
         let mut ids = ts_index
             .add_series_if_not_exists(series_keys)
             .await?
             .into_iter();
+
+        // 找到刚才空缺id的 seriesKey  为它们补充seriesId
         for item in res_sids.iter_mut() {
             if item.is_none() {
                 *item = Some(ids.next().ok_or(Error::CommonError {
@@ -467,6 +525,7 @@ impl Database {
     /// - `version_edits` are for all vnodes and db-files,
     /// - `file_metas` is for index data
     /// (field-id filter) of db-files.
+    /// 将该db的列族信息 变成edit并保存
     pub async fn snapshot(
         &self,
         vnode_id: Option<TseriesFamilyId>,
@@ -487,7 +546,9 @@ impl Database {
     }
 
     pub async fn get_series_key(&self, vnode_id: u32, sid: u32) -> IndexResult<Option<SeriesKey>> {
+        // 先找列族
         if let Some(idx) = self.get_ts_index(vnode_id) {
+            // 再找某个series
             return idx.get_series_key(sid).await;
         }
 
@@ -533,13 +594,16 @@ impl Database {
         self.ts_indexes.clone()
     }
 
+    // 生成某列族相关的索引
     pub async fn get_ts_index_or_add(&mut self, id: u32) -> Result<Arc<index::ts_index::TSIndex>> {
         if let Some(v) = self.ts_indexes.get(&id) {
             return Ok(v.clone());
         }
 
+        // 找到存储索引数据的路径
         let path = self.opt.storage.index_dir(&self.owner, id);
 
+        // 读取还原出索引
         let idx = index::ts_index::TSIndex::new(path).await?;
 
         self.ts_indexes.insert(id, idx.clone());

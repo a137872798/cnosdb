@@ -11,6 +11,8 @@ use crate::node_store::StoredSnapshot;
 use crate::{RaftNodeId, RaftNodeInfo};
 
 pub struct Key {}
+
+// 基于id 生成各种key
 impl Key {
     fn node_summary(id: u32) -> String {
         format!("node_summary_{}", id)
@@ -45,19 +47,29 @@ impl Key {
     }
 }
 
+
+// raft节点的描述信息
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 pub struct RaftNodeSummary {
+    // 租户信息
     pub tenant: String,
+    // 数据库信息
     pub db_name: String,
+    // raft组id
     pub group_id: u32,
+    // 节点id
     pub raft_id: u64,
 }
+
+// 也是用了heed框架
 pub struct StateStorage {
     env: Env,
     db: Database<Str, OwnedSlice<u8>>,
 }
 
+// 该对象维护了raft协议需要的一些状态信息
 impl StateStorage {
+
     pub fn open(path: impl AsRef<Path>) -> ReplicationResult<Self> {
         fs::create_dir_all(&path)?;
 
@@ -72,31 +84,34 @@ impl StateStorage {
         Ok(storage)
     }
 
+    // 获取事务读对象
     fn reader_txn(&self) -> ReplicationResult<heed::RoTxn> {
         let reader = self.env.read_txn()?;
 
         Ok(reader)
     }
 
+    // 获取事务读写对象
     fn writer_txn(&self) -> ReplicationResult<heed::RwTxn> {
         let writer = self.env.write_txn()?;
-
         Ok(writer)
     }
 
+
+    // 根据key 查询数据
     fn get<T>(&self, reader: &heed::RoTxn, key: &str) -> ReplicationResult<Option<T>>
     where
         for<'a> T: Deserialize<'a>,
     {
         if let Some(data) = self.db.get(reader, key)? {
             let val = serde_json::from_slice(&data)?;
-
             Ok(Some(val))
         } else {
             Ok(None)
         }
     }
 
+    // 将val转换成json后 存储到db中
     fn set<T>(&self, writer: &mut heed::RwTxn, key: &str, val: &T) -> ReplicationResult<()>
     where
         for<'a> T: Serialize,
@@ -114,6 +129,7 @@ impl StateStorage {
         Ok(())
     }
 
+    // 代表group准备就绪
     pub fn is_already_init(&self, group_id: u32) -> ReplicationResult<bool> {
         let reader = self.env.read_txn()?;
         if self
@@ -136,6 +152,7 @@ impl StateStorage {
         Ok(())
     }
 
+    // 获取raft组的所有成员
     pub fn get_last_membership(
         &self,
         group_id: u32,
@@ -148,6 +165,7 @@ impl StateStorage {
         Ok(mem_ship)
     }
 
+    // 更新成员信息
     pub fn set_last_membership(
         &self,
         group_id: u32,
@@ -160,6 +178,7 @@ impl StateStorage {
         Ok(())
     }
 
+    // 查看最新的日志id
     pub fn get_last_applied_log(
         &self,
         group_id: u32,
@@ -170,6 +189,7 @@ impl StateStorage {
         Ok(log_id)
     }
 
+    // 设置最新的日志id
     pub fn set_last_applied_log(
         &self,
         group_id: u32,
@@ -182,6 +202,7 @@ impl StateStorage {
         Ok(())
     }
 
+    // 获取最近一次清除对应的日志id
     pub fn get_last_purged(&self, group_id: u32) -> ReplicationResult<Option<LogId<u64>>> {
         let reader = self.reader_txn()?;
         let log_id: Option<LogId<RaftNodeId>> = self.get(&reader, &Key::purged_log_id(group_id))?;
@@ -189,6 +210,7 @@ impl StateStorage {
         Ok(log_id)
     }
 
+    // 设置清除后保留的日志id
     pub fn set_last_purged(&self, group_id: u32, log_id: LogId<u64>) -> ReplicationResult<()> {
         let mut writer = self.writer_txn()?;
         self.set(&mut writer, &Key::purged_log_id(group_id), &log_id)?;
@@ -197,6 +219,7 @@ impl StateStorage {
         Ok(())
     }
 
+    // 获取快照对应的偏移量
     pub fn get_snapshot_index(&self, group_id: u32) -> ReplicationResult<u64> {
         let reader = self.reader_txn()?;
         let index: u64 = self
@@ -206,6 +229,7 @@ impl StateStorage {
         Ok(index)
     }
 
+    // 设置快照偏移量
     pub fn set_snapshot_index(&self, group_id: u32, index: u64) -> ReplicationResult<()> {
         let mut writer = self.writer_txn()?;
         self.set(&mut writer, &Key::snapshot_index(group_id), &index)?;
@@ -214,6 +238,7 @@ impl StateStorage {
         Ok(())
     }
 
+    // 增加快照偏移量
     pub fn incr_snapshot_index(&self, group_id: u32, add: u64) -> ReplicationResult<u64> {
         let mut writer = self.writer_txn()?;
         let index: u64 = self
@@ -227,6 +252,7 @@ impl StateStorage {
         Ok(index)
     }
 
+    // 获取最新的投票信息
     pub fn get_vote(&self, group_id: u32) -> ReplicationResult<Option<Vote<RaftNodeId>>> {
         let reader = self.reader_txn()?;
         let vote_val: Option<Vote<RaftNodeId>> = self.get(&reader, &Key::vote_key(group_id))?;
@@ -234,6 +260,7 @@ impl StateStorage {
         Ok(vote_val)
     }
 
+    // 进行选票
     pub fn set_vote(&self, group_id: u32, vote: &Vote<RaftNodeId>) -> ReplicationResult<()> {
         let mut writer = self.writer_txn()?;
         self.set(&mut writer, &Key::vote_key(group_id), vote)?;
@@ -276,6 +303,7 @@ impl StateStorage {
         Ok(())
     }
 
+    // summary信息 一开始就存储在db中
     pub fn all_nodes_summary(&self) -> ReplicationResult<Vec<RaftNodeSummary>> {
         let mut nodes_summary = vec![];
         let reader = self.reader_txn()?;
@@ -289,6 +317,7 @@ impl StateStorage {
         Ok(nodes_summary)
     }
 
+    // 删除某个group相关的所有数据
     pub fn del_group(&self, group_id: u32) -> ReplicationResult<()> {
         let mut writer = self.writer_txn()?;
         self.del(&mut writer, &Key::applied_log(group_id))?;

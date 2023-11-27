@@ -59,7 +59,9 @@ impl From<std::io::Error> for Error {
 
 pub struct ServiceHandle<R> {
     pub name: String,
+    // 对应一个在后台运行的服务器线程
     join_handle: JoinHandle<R>,
+    // 通过该对象可以发送停止服务的信号
     shutdown: Sender<()>,
 }
 
@@ -73,9 +75,11 @@ impl<R> ServiceHandle<R> {
     }
     pub async fn shutdown(self, force: bool) {
         if force {
+            // 代表强制关闭
             self.join_handle.abort();
             return;
         }
+        // 优雅停机 shutdown的消息会发送到grpc服务
         let _ = self.shutdown.send(());
         let msg = format!("shutting down service {}", self.name);
         self.join_handle.await.expect(&msg);
@@ -84,10 +88,16 @@ impl<R> ServiceHandle<R> {
 
 #[derive(Default)]
 pub struct Server {
+    // ServiceRef 就是可以在多线程中共享的 Service 提供start/stop方法
+    // service抽象出来就是服务器能够提供的服务  代表能够提供多种服务
+    // server则模拟一个服务器  具备多种服务
     services: Vec<ServiceRef>,
 }
 
+// 通过服务器统一管理所有的服务
 impl Server {
+
+    // 追加一个服务
     pub fn add_service(&mut self, service: ServiceRef) {
         self.services.push(service);
     }
@@ -109,6 +119,7 @@ impl Server {
 pub(crate) struct ServiceBuilder {
     pub cpu: usize,
     pub config: config::Config,
+    // tokio的runtime对象 包含一些运行时信息
     pub runtime: Arc<Runtime>,
     pub memory_pool: MemoryPoolRef,
     pub metrics_register: Arc<MetricsRegister>,

@@ -30,15 +30,19 @@ pub type CheckFuture = BoxFuture<'static, CoordinatorResult<()>>;
 /// Generic API for connect a vnode and reading to a stream of [`RecordBatch`]
 pub trait VnodeOpener: Unpin {
     /// Asynchronously open the specified vnode and return a stream of [`RecordBatch`]
+    /// 打开一个副本节点 并从中读取数据
     fn open(&self, vnode: &VnodeInfo, option: &QueryOption) -> CoordinatorResult<VnodeOpenFuture>;
 }
 
 pub struct CheckedCoordinatorRecordBatchStream<O: VnodeOpener> {
+    // 通过该对象可以打开vnode 并读取数据
     opener: O,
     meta: MetaRef,
     tenant: Arc<String>,
     vnode: VnodeInfo,
     option: QueryOption,
+
+    // 描述当前流的状态
     state: StreamState,
 
     coord_data_out: U64Counter,
@@ -68,9 +72,12 @@ impl<O: VnodeOpener> CheckedCoordinatorRecordBatchStream<O> {
         }
     }
 
+    // 调用该方法 触发数据的拉取
     fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Option<CoordinatorResult<RecordBatch>>> {
         loop {
             match &mut self.state {
+
+                // 先检查目标节点能否正常访问
                 StreamState::Check(checker) => {
                     // TODO record time used
                     match ready!(checker.try_poll_unpin(cx)) {
@@ -81,6 +88,7 @@ impl<O: VnodeOpener> CheckedCoordinatorRecordBatchStream<O> {
                                 },
                             )?;
 
+                            // 切换成idle状态
                             self.state = StreamState::Idle;
                         }
 
@@ -89,12 +97,15 @@ impl<O: VnodeOpener> CheckedCoordinatorRecordBatchStream<O> {
                 }
                 StreamState::Idle => {
                     // TODO record time used
+                    // 准备好读取底层数据的对象
                     let future = match self.opener.open(&self.vnode, &self.option) {
                         Ok(future) => future,
                         Err(err) => return Poll::Ready(Some(Err(err))),
                     };
                     self.state = StreamState::Open(future);
                 }
+
+                // 开始读取数据
                 StreamState::Open(future) => {
                     // TODO record time used
                     match ready!(future.poll_unpin(cx)) {
@@ -103,6 +114,7 @@ impl<O: VnodeOpener> CheckedCoordinatorRecordBatchStream<O> {
                         }
                         Err(err) => {
                             if let CoordinatorError::FailoverNode { id: _, ref error } = err {
+                                // 切换到另一个节点重新进入idle阶段
                                 if let Some(vnode) = self.option.split.pop_front() {
                                     warn!("failover reader try to read another vnode: {:?}, error: {}", vnode, error);
                                     self.vnode = vnode;
@@ -116,7 +128,11 @@ impl<O: VnodeOpener> CheckedCoordinatorRecordBatchStream<O> {
                         }
                     };
                 }
+
+                // 进入scan阶段 开始扫描数据
                 StreamState::Scan(stream, state) => match state {
+
+                    // 当前扫描的状态
                     ScanState::Scan => match ready!(stream.poll_next_unpin(cx)) {
                         None => return Poll::Ready(None),
                         Some(res) => match res {
@@ -124,6 +140,8 @@ impl<O: VnodeOpener> CheckedCoordinatorRecordBatchStream<O> {
                                 let batch_memory = batch.get_array_memory_size();
                                 let meta = self.meta.clone();
                                 let tenant_name = self.tenant.clone();
+
+                                // 检查是否被限流
                                 let future = async move {
                                     meta.limiter(&tenant_name)
                                         .await?
@@ -136,6 +154,8 @@ impl<O: VnodeOpener> CheckedCoordinatorRecordBatchStream<O> {
                                     ScanState::CheckLimiter(batch, Box::pin(future)),
                                 );
                             }
+
+                            // 读取失败
                             Err(err) => {
                                 if tskv::Error::vnode_broken_code(err.error_code().code()) {
                                     let id = self.vnode.id;
@@ -148,6 +168,8 @@ impl<O: VnodeOpener> CheckedCoordinatorRecordBatchStream<O> {
                                         id,
                                         VnodeStatus::Broken,
                                     );
+
+                                    // 将节点标记为下线
                                     let future = change_vnode_to_broken(tenant.into(), id, meta);
                                     self.state =
                                         StreamState::UpdateVNodeBroken(Box::pin(future), err);
@@ -157,6 +179,8 @@ impl<O: VnodeOpener> CheckedCoordinatorRecordBatchStream<O> {
                             }
                         },
                     },
+
+                    // 代表当前正处于检测是否超流量
                     ScanState::CheckLimiter(b, c) => {
                         return match ready!(c.try_poll_unpin(cx)) {
                             Ok(_) => {
@@ -182,6 +206,8 @@ impl<O: VnodeOpener> CheckedCoordinatorRecordBatchStream<O> {
     }
 }
 
+
+// 作为流使用
 impl<O: VnodeOpener> Stream for CheckedCoordinatorRecordBatchStream<O> {
     type Item = Result<RecordBatch, CoordinatorError>;
 
@@ -195,6 +221,8 @@ impl<O: VnodeOpener> Stream for CheckedCoordinatorRecordBatchStream<O> {
     }
 }
 
+
+// 将节点标记为下线
 pub async fn change_vnode_to_broken(
     tenant: String,
     vnode_id: VnodeId,

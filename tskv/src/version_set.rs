@@ -21,7 +21,7 @@ use crate::{ColumnFileId, Options, TseriesFamilyId};
 
 #[derive(Debug)]
 pub struct VersionSet {
-    /// Maps DBName -> DB
+    /// Maps DBName -> DB      版本集中存储了多个db数据  版本集的信息又是通过summary维护的
     dbs: HashMap<String, Arc<RwLock<Database>>>,
     runtime: Arc<Runtime>,
     db_factory: DatabaseFactory,
@@ -29,7 +29,7 @@ pub struct VersionSet {
 
 impl VersionSet {
     pub fn empty(
-        meta: MetaRef,
+        meta: MetaRef,  // 通过该对象与元数据服务交互
         opt: Arc<Options>,
         runtime: Arc<Runtime>,
         memory_pool: MemoryPoolRef,
@@ -59,6 +59,7 @@ impl VersionSet {
         }
     }
 
+    // 根据相关参数 进行初始化
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         meta: MetaRef,
@@ -66,36 +67,43 @@ impl VersionSet {
         runtime: Arc<Runtime>,
         memory_pool: MemoryPoolRef,
         ver_set: HashMap<TseriesFamilyId, Arc<Version>>,
-        flush_task_sender: Sender<FlushReq>,
+        flush_task_sender: Sender<FlushReq>,   // 通过2个sender对象 向下发送任务
         compact_task_sender: Sender<CompactTask>,
         metrics_register: Arc<MetricsRegister>,
     ) -> Result<Self> {
         let mut dbs = HashMap::new();
         let db_factory = DatabaseFactory::new(meta.clone(), memory_pool, metrics_register, opt);
 
+        // 初始化的时候  根据元数据上记录的信息 补充version中的db信息
         for ver in ver_set.into_values() {
+            // 拆解得到租户名和数据库名
             let owner = ver.tenant_database().to_string();
             let (tenant, database) = split_owner(&owner);
 
+            // 获取该租户相关的元数据信息
             let schema = match meta.tenant_meta(tenant).await {
                 None => DatabaseSchema::new(tenant, database),
+                // 从租户上获取该db的元数据信息
                 Some(client) => match client.get_db_schema(database).context(MetaSnafu)? {
                     None => DatabaseSchema::new(tenant, database),
                     Some(schema) => schema,
                 },
             };
 
+            // 产生db 对象
             let db: &mut Arc<RwLock<Database>> = dbs.entry(owner).or_insert(Arc::new(RwLock::new(
                 db_factory.create_database(schema).await?,
             )));
 
             let tf_id = ver.tf_id();
+            // 初始化 database相关的一些组件
             db.write().await.open_tsfamily(
                 runtime.clone(),
                 ver,
                 flush_task_sender.clone(),
                 compact_task_sender.clone(),
             );
+            // 产生索引
             db.write().await.get_ts_index_or_add(tf_id).await?;
         }
 
@@ -127,6 +135,7 @@ impl VersionSet {
         self.dbs.get(&owner).is_some()
     }
 
+    // 获取某db的schema
     pub async fn get_db_schema(
         &self,
         tenant: &str,
@@ -153,6 +162,7 @@ impl VersionSet {
         None
     }
 
+    // 返回某个列族
     pub async fn get_tsfamily_by_tf_id(&self, tf_id: u32) -> Option<Arc<RwLock<TseriesFamily>>> {
         // FIXME: add tsf_id -> db HashTable
         for db in self.dbs.values() {
@@ -164,6 +174,7 @@ impl VersionSet {
         None
     }
 
+    // 获取某个列族 以及相关的索引数据
     pub async fn get_tsfamily_tsindex_by_tf_id(
         &self,
         tf_id: u32,
@@ -203,6 +214,7 @@ impl VersionSet {
     /// Generated data is `VersionEdit`s for all vnodes and db-files,
     /// and `HashMap<ColumnFileId, Arc<BloomFilter>>` for index data
     /// (field-id filter) of db-files.
+    /// 返回当前VersionSet 快照信息
     pub async fn snapshot(&self) -> (Vec<VersionEdit>, HashMap<ColumnFileId, Arc<BloomFilter>>) {
         let mut version_edits = vec![];
         let mut file_metas: HashMap<ColumnFileId, Arc<BloomFilter>> = HashMap::new();
@@ -215,6 +227,7 @@ impl VersionSet {
         (version_edits, file_metas)
     }
 
+    // 获取每个列族最新的序列号
     pub async fn get_tsfamily_seq_no_map(&self) -> HashMap<TseriesFamilyId, u64> {
         let mut r = HashMap::with_capacity(self.dbs.len());
         for db in self.dbs.values() {

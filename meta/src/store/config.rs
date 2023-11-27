@@ -5,11 +5,16 @@ use std::path::Path;
 use config::LogConfig;
 use serde::{Deserialize, Serialize};
 
+// 元数据模块的配置信息
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MetaInit {
+    // 每个元数据服务器 与一个集群关联
     pub cluster_name: String,
+    // 集群管理员账号
     pub admin_user: String,
+    // 系统租户
     pub system_tenant: String,
+    // 默认创建的数据库
     pub default_database: Vec<String>,
 }
 
@@ -42,20 +47,28 @@ pub struct HeartBeatConfig {
 impl Default for HeartBeatConfig {
     fn default() -> Self {
         Self {
+            // 应该是代表续约时间为 300 秒 而一旦超过600秒还没有续约 就可以认为节点下线了
             heartbeat_recheck_interval: 300,
             heartbeat_expired_interval: 600,
         }
     }
 }
 
+
+// 代表元数据服务器的相关配置
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Opt {
+    // 服务器id
     pub id: u64,
     pub host: String,
     pub port: u16,
+    // 存储元数据的地址
     pub data_path: String,
+    // 日记信息
     pub log: LogConfig,
+    // 元数据的描述信息
     pub meta_init: MetaInit,
+    // 元数据需要一个心跳配置
     pub heartbeat: HeartBeatConfig,
 }
 
@@ -73,12 +86,16 @@ impl Default for Opt {
     }
 }
 
+// 加载配置文件 得到opt信息
 pub fn get_opt(path: Option<impl AsRef<Path>>) -> Opt {
+    // 返回默认配置
     if path.is_none() {
         return Default::default();
     }
     let path = path.unwrap();
     let path = path.as_ref();
+
+    // 打开文件
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(err) => panic!(
@@ -95,6 +112,8 @@ pub fn get_opt(path: Option<impl AsRef<Path>>) -> Opt {
             err
         );
     }
+
+    // 调用toml库 解析toml文件
     let config: Opt = match toml::from_str(&content) {
         Ok(config) => config,
         Err(err) => panic!(

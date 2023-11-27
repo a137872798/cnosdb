@@ -16,6 +16,7 @@ pub enum ValueType {
 }
 
 /// data type for tskv
+/// 描述数据类型
 #[derive(Serialize, Deserialize, Debug, PartialEq, Copy, Clone, Eq, Hash)]
 pub enum PhysicalDType {
     Unknown,

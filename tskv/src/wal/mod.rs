@@ -88,9 +88,11 @@ const WAL_FOOTER_MAGIC_NUMBER_LEN: usize = 4;
 const SEGMENT_MAGIC: [u8; 4] = [0x57, 0x47, 0x4c, 0x00];
 
 /// A channel sender that send write WAL result: `(seq_no: u64, written_size: usize)`
+/// 使用管道发送写入数据的结果
 type WriteResultSender = oneshot::Sender<crate::Result<(u64, usize)>>;
 type WriteResultReceiver = oneshot::Receiver<crate::Result<(u64, usize)>>;
 
+// wal日志内的数据也有多种类型 代表不同含义
 #[repr(u8)]
 #[derive(Eq, PartialEq, Clone, Copy, Debug)]
 pub enum WalType {
@@ -137,13 +139,18 @@ impl Display for WalType {
     }
 }
 
+// 一个写入任务
 pub struct WalTask {
     pub seq: u64,
+    // 描述任务信息 包括数据
     pub task: writer::Task,
+    // 用于通知写入结果
     pub result_sender: WriteResultSender,
 }
 
 impl WalTask {
+
+    // 生成各种 WalTask
     pub fn new_write(
         tenant: String,
         database: String,
@@ -246,6 +253,7 @@ impl WalTask {
         )
     }
 
+    // 从一个存在的task 创建一个新的task
     pub fn new_from(wal_task: &WalTask, cb: WriteResultSender) -> WalTask {
         WalTask {
             seq: wal_task.seq,
@@ -254,6 +262,7 @@ impl WalTask {
         }
     }
 
+    // 返回写入类型
     pub fn wal_entry_type(&self) -> WalType {
         match self.task {
             writer::Task::Write { .. } => WalType::Write,
@@ -268,6 +277,7 @@ impl WalTask {
         self.result_sender
     }
 
+    // 发送失败信息
     pub fn fail(self, e: crate::Error) -> crate::Result<()> {
         self.write_wal_result_sender()
             .send(Err(e))
@@ -285,6 +295,7 @@ impl WalTask {
     }
 }
 
+// 在上层封装Wal对象 用于读写下层的wal文件
 #[async_trait::async_trait]
 pub trait Wal {
     type Task;
@@ -305,16 +316,21 @@ pub trait Wal {
     fn current_seq_no(&self) -> u64;
 }
 
+// 每个vnode会关联一组wal文件
 pub struct VnodeWal {
     config: Arc<WalOptions>,
+    // 存储wal文件的目录
     wal_dir: PathBuf,
     tenant_database: Arc<String>,
     vnode_id: VnodeId,
+    // 通过该对象写入数据
     current_wal: WalWriter,
 
     /// Stores wal_id-wal_reader entry when a `WalReader` opened by `read(wal_id, pos)`.
+    /// 每个文件对应一个reader
     wal_reader_index: HashMap<u64, WalReader>,
     /// Maps seq_no to (WAL id, position).
+    /// 描述每个文件此时的偏移量
     wal_location_index: BTreeMap<u64, (u64, usize)>,
 }
 
@@ -325,6 +341,7 @@ impl VnodeWal {
         vnode_id: VnodeId,
     ) -> Result<Self> {
         let wal_dir = config.wal_dir(&tenant_database, vnode_id);
+        // 创建第一个文件
         let current_file =
             writer::WalWriter::open(config.clone(), 0, file_utils::make_wal_file(&wal_dir, 0), 1)
                 .await
@@ -342,7 +359,9 @@ impl VnodeWal {
         })
     }
 
+    // 尝试切换到新文件
     async fn roll_wal_file(&mut self, max_file_size: u64) -> Result<()> {
+        // 触发切换逻辑
         if self.current_wal.size() > max_file_size {
             trace::info!(
                 "WAL '{}' is full at seq '{}', begin rolling.",
@@ -351,8 +370,10 @@ impl VnodeWal {
             );
 
             let new_file_id = self.current_wal.id() + 1;
+            // 产生新文件
             let new_file_name = file_utils::make_wal_file(&self.wal_dir, new_file_id);
 
+            // 生成writer对象  作为当前对象
             let new_file = writer::WalWriter::open(
                 self.config.clone(),
                 new_file_id,
@@ -377,8 +398,10 @@ impl VnodeWal {
         Ok(())
     }
 
+    // 按照id删除wal文件
     pub async fn delete_wal_files(&mut self, wal_ids: &[u64]) {
         for wal_id in wal_ids {
+            // 跳过当前文件
             if *wal_id == self.current_wal.id() {
                 continue;
             }
@@ -397,6 +420,7 @@ impl VnodeWal {
     pub async fn write(&mut self, wal_task: WalTask) {
         match self.write_inner_task(&wal_task.task).await {
             Ok((seq, size)) => {
+                // 发送结果
                 if let Err(e) = wal_task.result_sender.send(Ok((seq, size))) {
                     // WAL job closed, leaving this write request.
                     trace::warn!("send WAL write result failed: {:?}", e);
@@ -410,7 +434,10 @@ impl VnodeWal {
         }
     }
 
+    // 将任务发送给下层的 writer对象
     async fn write_inner_task(&mut self, task: &writer::Task) -> Result<(u64, usize)> {
+
+        // 每次先检查是否要roll文件
         if let Err(e) = self.roll_wal_file(self.config.max_file_size).await {
             trace::error!("Failed to roll WAL file: {}", e);
             return Err(e);
@@ -475,6 +502,7 @@ impl VnodeWal {
         }
     }
 
+    // 写入raft的一个日志
     async fn write_raft_entry(
         &mut self,
         raft_entry: &raft_store::RaftEntry,
@@ -486,6 +514,7 @@ impl VnodeWal {
         let reader = match self.wal_reader_index.get_mut(&wal_id) {
             Some(r) => r,
             None => {
+                // 惰性创建
                 let reader = if wal_id == self.current_wal_id() {
                     // Use the same wal as the writer.
                     self.current_wal.new_reader()
@@ -506,6 +535,7 @@ impl VnodeWal {
         }
     }
 
+    // 将该偏移量后的所有数据文件生成的reader返回
     pub async fn recover(&self, min_log_seq: u64) -> Result<Vec<WalReader>> {
         trace::warn!("Recover: reading wal from seq '{}'", min_log_seq);
 
@@ -558,6 +588,7 @@ impl VnodeWal {
     }
 }
 
+// 每个vnode节点关联一个wal目录  而多个vnode就需要一个manager对象了
 pub struct WalManager {
     config: Arc<WalOptions>,
     vnode_wal_map: HashMap<VnodeId, VnodeWal>,
@@ -573,13 +604,22 @@ impl WalManager {
         version_set: Arc<RwLock<VersionSet>>,
     ) -> Result<Self> {
         let mut vnode_wal_map = HashMap::new();
+        // 遍历所有db
         for (db_name, database) in version_set.read().await.get_all_db() {
             let tenant_database = database.read().await.owner();
+
+            // 获取该db下所有vnode
             for vnode_id in database.read().await.ts_families().keys().copied() {
+
+                // 根据vnode 创建目录
                 let wal_dir = config.wal_dir(db_name, vnode_id);
+
+                // 遍历下面所有wal文件
                 let file_names = file_manager::list_file_names(wal_dir.clone());
                 for f in file_names {
                     let file_path = wal_dir.join(&f);
+
+                    // 检查文件完整性
                     match reader::read_footer(&file_path).await {
                         Ok(Some((min_seq, max_seq))) => match file_utils::get_wal_file_id(&f) {
                             Ok(file_id) => {
@@ -600,6 +640,7 @@ impl WalManager {
                 }
 
                 // Create a new wal file every time it starts.
+                // 查看目录下的数据文件 得到最大序列号 和文件id
                 let (pre_max_seq, next_file_id) = match file_utils::get_max_sequence_file_name(
                     &wal_dir,
                     file_utils::get_wal_file_id,
@@ -613,11 +654,14 @@ impl WalManager {
                     None => (1_u64, 1_u64),
                 };
 
+                // 通过序列号和文件id  生成新文件
                 let new_wal = file_utils::make_wal_file(&wal_dir, next_file_id);
                 let current_file =
                     writer::WalWriter::open(config.clone(), next_file_id, new_wal, pre_max_seq)
                         .await?;
                 trace::info!("WAL '{}' starts write", current_file.id());
+
+                // 相关信息就构成了一个 VnodeWal
                 let vnode_wal = VnodeWal {
                     config: config.clone(),
                     wal_dir,
@@ -637,8 +681,11 @@ impl WalManager {
         })
     }
 
+    // 根据task信息 准确定位到 vnodeWal对象 并触发写入
     pub async fn write(&mut self, wal_task: WalTask) -> Result<()> {
         let vnode_id = wal_task.vnode_id();
+
+        // 未指定vnode 代表发往所有节点
         match vnode_id {
             None => {
                 let mut rxs = Vec::with_capacity(self.vnode_wal_map.len());
@@ -695,6 +742,8 @@ impl WalManager {
         let mut recover_task = vec![];
         for (vnode_id, vnode_wal) in self.vnode_wal_map.iter() {
             let min_seq = vnode_min_seq_map.get(vnode_id).copied().unwrap_or(0);
+
+            // 加载指定偏移量后的所有数据文件
             if let Ok(readers) = vnode_wal.recover(min_seq).await {
                 recover_task.push((*vnode_id, readers));
             } else {
@@ -704,6 +753,8 @@ impl WalManager {
         recover_task
     }
 
+
+    // 对所有数据文件进行一次 sync
     pub async fn sync(&self) -> Result<()> {
         let mut sync_task = vec![];
         for (_, vnode_wal) in self.vnode_wal_map.iter() {
@@ -737,6 +788,7 @@ impl WalManager {
 }
 
 pub struct WalDecoder {
+    // 一个简易容器
     buffer: Vec<MiniVec<u8>>,
     decoder: Box<dyn StringCodec + Send + Sync>,
 }

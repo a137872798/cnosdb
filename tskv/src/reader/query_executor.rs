@@ -15,8 +15,10 @@ use crate::EngineRef;
 
 pub struct QueryExecutor {
     option: QueryOption,
+    // 通过该对象与元数据服务交互
     meta: MetaRef,
     runtime: Arc<Runtime>,
+    // 存储引擎 通过该对象与底层的数据文件/索引文件 交互
     kv_inst: EngineRef,
 }
 
@@ -37,11 +39,14 @@ impl QueryExecutor {
 
     pub fn local_node_executor(
         &self,
-        vnodes: Vec<VnodeInfo>,
+        vnodes: Vec<VnodeInfo>,  // 描述节点信息
         span_ctx: Option<&SpanContext>,
     ) -> Result<SendableTskvRecordBatchStream> {
+
+        // 每个节点对应一个 recordBatch
         let mut streams: Vec<BoxStream<Result<RecordBatch>>> = Vec::with_capacity(vnodes.len());
 
+        // 用于查看每个vnode的表信息
         vnodes.into_iter().for_each(|vnode| {
             let input = Box::pin(LocalTskvTableScanStream::new(
                 vnode.id,
@@ -61,6 +66,7 @@ impl QueryExecutor {
         Ok(Box::pin(parallel_merge_stream))
     }
 
+    // 获取tab流
     pub fn local_node_tag_scan(
         &self,
         vnodes: Vec<VnodeInfo>,

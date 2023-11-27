@@ -17,6 +17,7 @@ use crate::file_system::file::IFile;
 use crate::file_system::file_manager;
 
 /// Returns footer position and footer data.
+/// 从文件中读取footer信息
 pub async fn read_footer(path: impl AsRef<Path>) -> Result<(u64, [u8; FILE_FOOTER_LEN])> {
     let path = path.as_ref();
     let file = file_manager::open_file(&path).await?;
@@ -24,25 +25,31 @@ pub async fn read_footer(path: impl AsRef<Path>) -> Result<(u64, [u8; FILE_FOOTE
 }
 
 /// Returns footer position and footer data.
+/// 从文件中读取footer信息
 pub async fn read_footer_from(
     file: &AsyncFile,
     file_path: impl AsRef<Path>,
 ) -> Result<(u64, [u8; FILE_FOOTER_LEN])> {
+
+    // 长度不足以容纳footer信息
     if file.len() < (FILE_MAGIC_NUMBER_LEN + FILE_FOOTER_LEN) as u64 {
         return Err(Error::NoFooter);
     }
 
-    // Get file crc
+    // Get file crc    读取参与crc计算的数据
     let mut buf = vec![0_u8; file_crc_source_len(file.len(), FILE_FOOTER_LEN)];
+    //
     if let Err(e) = file.read_at(FILE_MAGIC_NUMBER_LEN as u64, &mut buf).await {
         return Err(Error::ReadFile {
             path: file_path.as_ref().to_path_buf(),
             source: e,
         });
     }
+
+    // 计算crc的值
     let crc = crc32fast::hash(&buf);
 
-    // Read footer
+    // Read footer  footer的起始位置
     let footer_pos = file.len() - FILE_FOOTER_LEN as u64;
     let mut footer = [0_u8; FILE_FOOTER_LEN];
     if let Err(e) = file.read_at(footer_pos, &mut footer[..]).await {
@@ -52,13 +59,14 @@ pub async fn read_footer_from(
         });
     }
 
-    // Check file crc
+    // Check file crc    读取crc
     let footer_crc = decode_be_u32(
         &footer[FILE_FOOTER_MAGIC_NUMBER_LEN
             ..FILE_FOOTER_MAGIC_NUMBER_LEN + FILE_FOOTER_CRC32_NUMBER_LEN],
     );
 
     // If crc doesn't match, this file may not contain a footer.
+    // 代表还没 写入crc
     if crc != footer_crc {
         Err(Error::NoFooter)
     } else {
@@ -66,12 +74,13 @@ pub async fn read_footer_from(
     }
 }
 
+// 用于读取文件
 pub struct Reader {
-    path: PathBuf,
-    file: Arc<AsyncFile>,
-    file_len: u64,
-    pos: usize,
-    buf: Vec<u8>,
+    path: PathBuf,  // 存储path信息
+    file: Arc<AsyncFile>,  // 底层文件
+    file_len: u64,  // 文件总长度
+    pos: usize,  // 目前读取的偏移量
+    buf: Vec<u8>,  // 数据会先读取到缓冲区
     buf_len: usize,
     buf_use: usize,
     footer: Option<[u8; FILE_FOOTER_LEN]>,
@@ -79,9 +88,13 @@ pub struct Reader {
 }
 
 impl Reader {
+
+    // 通过path打开一个文件
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let file = file_manager::open_file(path).await?;
+
+        // 读取footer信息
         let (footer_pos, footer) = match read_footer_from(&file, path).await {
             Ok((p, f)) => (p, Some(f)),
             Err(Error::NoFooter) => (file.len(), None),
@@ -94,6 +107,8 @@ impl Reader {
             }
         };
         let file_len = file.len();
+
+        // 计算文件的有效长度
         let records_len = if footer_pos == file_len {
             // If there is no footer
             file_len - FILE_MAGIC_NUMBER_LEN as u64
@@ -114,6 +129,7 @@ impl Reader {
         })
     }
 
+    // writer可以根据已有的信息 快捷创建reader
     pub(super) fn new(
         file: Arc<AsyncFile>,
         path: PathBuf,
@@ -141,7 +157,9 @@ impl Reader {
     }
 
     /// Set self.pos, load buffer if needed.
+    /// 设置游标 从指定位置开始读取数据
     async fn set_pos(&mut self, pos: usize) -> Result<()> {
+        // 代表回退了这么多 相当于清空buf的数据
         if self.pos - self.buf_use == pos {
             self.pos = pos;
             self.buf_use = 0;
@@ -160,6 +178,7 @@ impl Reader {
                         self.buf_use -= size;
                         Ok(())
                     }
+                    // 更新了pos 尝试继续将数据读取到buf
                     _ => self.load_buf().await,
                 }
             }
@@ -181,8 +200,10 @@ impl Reader {
     /// Returns a position where to read the header and the header slice.
     async fn find_record_header(&mut self) -> Result<(usize, &[u8])> {
         loop {
+            // 读取一个 record header的长度
             let magic_number_sli = self.read_buf(RECORD_MAGIC_NUMBER_LEN).await?;
             let magic_number = decode_be_u32(magic_number_sli);
+            // 解出来发现是header
             if magic_number == RECORD_MAGIC_NUMBER {
                 let pos = self.pos;
                 let header = self.read_buf(RECORD_HEADER_LEN).await?;
@@ -198,12 +219,17 @@ impl Reader {
     /// - Eof - file reads to a end.
     /// - RecordFileInvalidDataSize - file is broken that data size is too big.
     /// - RecordFileHashCheckFailed - file may be broken that data crc not match.
+    ///
+    /// 读取下一块record
     pub async fn read_record(&mut self) -> Result<Record> {
         // The previous position, if the previous error is not the HashCheckFailed,
         // this value will be updated.
+        // 读到末尾了
         if (self.pos + RECORD_HEADER_LEN) as u64 >= self.footer_pos {
             return Err(Error::Eof);
         }
+
+        // 先读取一个header  里面记录了一些信息
         let (header_pos, header) = self.find_record_header().await?;
 
         let mut p = RECORD_MAGIC_NUMBER_LEN;
@@ -223,7 +249,11 @@ impl Reader {
 
         // TODO: Check if data_size is too large.
         let data_pos = header_pos + RECORD_HEADER_LEN;
+
+        // 设置读取起点
         self.set_pos(data_pos).await?;
+
+        // 解开header后 得到了size 按需读取
         let data = match self.read_buf(data_size as usize).await {
             Ok(record_bytes) => {
                 let record_data = record_bytes.to_vec();
@@ -237,6 +267,8 @@ impl Reader {
                         len: data_size,
                     });
                 }
+
+                // 更新起点
                 self.set_pos(data_pos + data_size as usize).await?;
                 record_data
             }
@@ -254,6 +286,8 @@ impl Reader {
         hasher.update(&data);
         // check crc32 number
         let data_crc_calculated = hasher.finalize();
+
+        // 代表读取的数据有问题
         if data_crc_calculated != data_crc {
             // If crc not match, try to get header from the next pos.
             trace::error!(
@@ -273,6 +307,7 @@ impl Reader {
             });
         }
 
+        // 返回数据
         Ok(Record {
             data_type,
             data_version,
@@ -310,6 +345,7 @@ impl Reader {
         Ok(())
     }
 
+    // 将指定长度数据读取到buf中
     async fn read_buf(&mut self, size: usize) -> Result<&[u8]> {
         if self.buf.capacity() < size {
             self.buf.resize(size, 0_u8);
@@ -318,9 +354,11 @@ impl Reader {
             self.load_buf().await?;
         }
         let right_bound = (self.buf_use + size).min(self.buf_len);
+        // 读取中间部分的数据 对应size数据
         Ok(&self.buf[self.buf_use..right_bound])
     }
 
+    // 重新加载文件元数据
     pub async fn reload_metadata(&mut self) -> Result<()> {
         let meta = tokio::fs::metadata(&self.path)
             .await

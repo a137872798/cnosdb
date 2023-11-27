@@ -14,21 +14,31 @@ use crate::file_system::file::async_file::AsyncFile;
 use crate::file_system::file::IFile;
 use crate::file_system::file_manager;
 
+// 通过该对象与文件交互
 pub struct Writer {
+
+    // 存储路径信息
     path: PathBuf,
+    // 底层异步文件
     file: Arc<AsyncFile>,
 
     footer: Option<[u8; FILE_FOOTER_LEN]>,
+
+    // 当前写到的偏移量
     pos: u64,
+    // 文件总大小
     file_size: u64,
 }
 
 impl Writer {
     pub async fn open(path: impl AsRef<Path>, _data_type: RecordDataType) -> Result<Self> {
         let path = path.as_ref();
+
+        // 创建异步文件
         let file = file_manager::open_create_file(path).await?;
         if file.is_empty() {
             // For new file, write file magic number, next write is at 4.
+            // 写入header
             let file_size = file
                 .write_at(0, &FILE_MAGIC_NUMBER.to_be_bytes())
                 .await
@@ -41,8 +51,10 @@ impl Writer {
                 file_size,
             })
         } else {
+            // 代表该文件之前存在 且有数据
             let footer = match reader::read_footer(&path).await {
                 Ok((_, f)) => Some(f),
+                // 有可能来不及写入footer
                 Err(Error::NoFooter) => None,
                 Err(e) => {
                     trace::error!(
@@ -57,6 +69,8 @@ impl Writer {
             // Note that footer_len may be zero.
             let footer_len = footer.map(|f| f.len()).unwrap_or(0);
             // Truncate this file to overwrite footer data.
+
+            // 代表要续写这个文件  先去掉footer
             let file_size = file
                 .len()
                 .checked_sub(footer_len as u64)
@@ -74,6 +88,7 @@ impl Writer {
     }
 
     // Writes record data and returns the written data size.
+    // 往文件中写入数据
     pub async fn write_record<R, D>(
         &mut self,
         data_version: u8,
@@ -103,24 +118,31 @@ impl Writer {
         let mut hasher = crc32fast::Hasher::new();
         let data_meta = [data_version, data_type];
         hasher.update(&data_meta);
+
+        // 数据的长度
         let data_len = data_len.to_be_bytes();
         hasher.update(&data_len);
         for d in data.iter() {
             hasher.update(d.as_ref());
         }
+
+        // 基于新数据计算crc
         let data_crc = hasher.finalize().to_be_bytes();
 
+        // 每块记录前都有一个魔数
         let magic_number = RECORD_MAGIC_NUMBER.to_be_bytes();
         let mut write_buf: Vec<IoSlice> = Vec::with_capacity(6);
         write_buf.push(IoSlice::new(&magic_number));
         write_buf.push(IoSlice::new(&data_meta));
         write_buf.push(IoSlice::new(&data_len));
         write_buf.push(IoSlice::new(&data_crc));
+        // 这里写入数据
         for d in data {
             write_buf.push(IoSlice::new(d.as_ref()));
         }
 
         // Write record header and record data.
+        // 调用file api 写入数据
         let written_size = self
             .file
             .write_vec(self.pos, &mut write_buf)
@@ -134,7 +156,9 @@ impl Writer {
         Ok(written_size)
     }
 
+    // 写入footer数据
     pub async fn write_footer(&mut self, footer: &mut [u8; FILE_FOOTER_LEN]) -> Result<usize> {
+        // 文件数据刷盘
         self.sync().await?;
 
         // Get file crc
@@ -165,6 +189,7 @@ impl Writer {
         Ok(written_size)
     }
 
+    // 定期刷盘
     pub async fn sync(&self) -> Result<()> {
         self.file.sync_data().await.context(error::SyncFileSnafu)
     }
@@ -173,6 +198,7 @@ impl Writer {
         self.sync().await
     }
 
+    // 针对该文件生成一个reader对象
     pub fn new_reader(&self) -> reader::Reader {
         reader::Reader::new(
             self.file.clone(),

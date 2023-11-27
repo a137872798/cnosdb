@@ -26,9 +26,14 @@ pub mod state_store;
 
 pub type RaftNodeId = u64;
 
+// 将元数据服务器作为raft组中的一个节点
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, Default)]
 pub struct RaftNodeInfo {
+
+    // 选举组 在同一个组的元数据服务器会参与选举
     pub group_id: u32,   // raft group id
+
+    // 本节点的地址
     pub address: String, // server address
 }
 
@@ -46,6 +51,7 @@ pub struct RaftNodeInfo {
 // }
 openraft::declare_raft_types!(
     /// Declare the type configuration.
+    /// 会自动实现 RaftTypeConfig 特征
     pub TypeConfig:
         D = Request,
         R = Response,
@@ -81,6 +87,7 @@ pub struct ApplyContext {
     pub raft_id: RaftNodeId,
 }
 
+// 应用接口 上层请求来自raft
 #[async_trait]
 pub trait ApplyStorage: Send + Sync + Any {
     async fn apply(&self, ctx: &ApplyContext, req: &Request) -> ReplicationResult<Response>;
@@ -90,24 +97,31 @@ pub trait ApplyStorage: Send + Sync + Any {
 }
 pub type ApplyStorageRef = Arc<dyn ApplyStorage + Send + Sync>;
 
+// 存储raft日志实体的仓库
 #[async_trait]
 pub trait EntryStorage: Send + Sync {
     // Get the entry by index
+    // 根据index获取entry
     async fn entry(&self, index: u64) -> ReplicationResult<Option<Entry<TypeConfig>>>;
 
     // Delete entries: from begin to index
+    // 删除0-index的entry
     async fn del_before(&self, index: u64) -> ReplicationResult<()>; // [0, index)
 
     // Delete entries: from index to end
+    // 删除index之后的entry
     async fn del_after(&self, index: u64) -> ReplicationResult<()>; // [index, ...)
 
     // Write entries
+    // 往storage中追加一个entry
     async fn append(&self, ents: &[Entry<TypeConfig>]) -> ReplicationResult<()>;
 
     // Get the last entry
+    // 获取最新的entry
     async fn last_entry(&self) -> ReplicationResult<Option<Entry<TypeConfig>>>;
 
     // Get entries from begin to end
+    // 返回范围内的一组entry
     async fn entries(&self, begin: u64, end: u64) -> ReplicationResult<Vec<Entry<TypeConfig>>>; // [begin, end)
 }
 pub type EntryStorageRef = Arc<dyn EntryStorage>;

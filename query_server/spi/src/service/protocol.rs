@@ -10,6 +10,7 @@ use crate::query::config::StreamTriggerInterval;
 use crate::query::execution::Output;
 use crate::query::session::CnosSessionConfig;
 
+// 从目前来看 每个查询会对应一个状态机 并且关联一个id
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct QueryId(u64);
 
@@ -43,8 +44,10 @@ impl TryFrom<Vec<u8>> for QueryId {
             return Err(format!("Incorrect content: {:?}", &bytes));
         }
 
+        // 8*8 构成64位id
         let len_bytes: [u8; 8] = unsafe { bytes[0..8].try_into().unwrap_unchecked() };
 
+        // 这里还涉及到大小端
         Ok(Self(u64::from_le_bytes(len_bytes)))
     }
 }
@@ -61,18 +64,19 @@ impl Display for QueryId {
     }
 }
 
+/// 在协议层 定义了查询的上下文   每当收到一个请求时 就会根据当前用户信息等产生context 并在整个查询过程中传递
 #[derive(Clone)]
 pub struct Context {
     // todo
     // user info
     // security certification info
     // ...
-    user_info: User,
-    tenant: String,
-    database: String,
-    precision: String,
+    user_info: User,    // 当前用户信息
+    tenant: String,     // 当前租户信息
+    database: String,   // 指定的数据库  数据库可能有多个
+    precision: String,  // 精度
     chunked: bool,
-    session_config: CnosSessionConfig,
+    session_config: CnosSessionConfig,  // 底层是datafusion
 }
 
 impl Context {
@@ -111,6 +115,7 @@ impl SpanRecorderExt for Context {
     }
 }
 
+// 用于构建上下文
 pub struct ContextBuilder {
     user_info: User,
     tenant: String,
@@ -188,6 +193,7 @@ impl ContextBuilder {
     }
 }
 
+// 这是由前端服务器接收到sql后 与上下文包装的对象
 #[derive(Clone)]
 pub struct Query {
     context: Context,
@@ -219,9 +225,9 @@ impl SpanRecorderExt for Query {
 
 // #[derive(Clone)]
 pub struct QueryHandle {
-    id: QueryId,
-    query: Query,
-    result: Output,
+    id: QueryId,   // 对应本次查询的id
+    query: Query,   // 包含查询语句和上下文
+    result: Output,  // 表示一个查询结果
 }
 
 impl QueryHandle {

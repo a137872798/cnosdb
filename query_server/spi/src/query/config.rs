@@ -1,12 +1,14 @@
 use std::str::FromStr;
 use std::time::Duration;
 
+// 代表是单次流 还是每隔多少秒触发一次
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamTriggerInterval {
     Once,
     Interval(Duration),
 }
 
+// 可以从表达式 转换成间隔时间
 impl FromStr for StreamTriggerInterval {
     type Err = String;
 

@@ -90,9 +90,13 @@ impl From<WriteTsmError> for Error {
     }
 }
 
+// 缓存列数据相关的索引 列数据存储在DataBlock结构中 Index则作为所有列的数据 IndexEntry对应到具体某列  使用索引可以加快查找
 struct IndexBuf {
+    // 代表当前写到第几个索引了
     index_offset: u64,
+    // 维护每个列的索引数据   IndexEntry内部又以block为单位进行存储
     buf: BTreeMap<FieldId, IndexEntry>,
+    // 快速检测某个field是否存在
     bloom_filter: BloomFilter,
 }
 
@@ -105,17 +109,21 @@ impl IndexBuf {
         }
     }
 
+    // 更新索引偏移量
     pub fn set_index_offset(&mut self, index_offset: u64) {
         self.index_offset = index_offset;
     }
 
+    // 往IndexEntry中追加一个 BlockEntry
     pub fn insert_block_meta(&mut self, ie: IndexEntry, be: BlockEntry) {
         let fid = ie.field_id;
         let idx = self.buf.entry(fid).or_insert(ie);
         idx.blocks.push(be);
+        // 将fieldId 加入到过滤器
         self.bloom_filter.insert(&fid.to_be_bytes()[..]);
     }
 
+    // 将数据写入到文件
     pub async fn write_to(&self, writer: &mut FileCursor) -> WriteTsmResult<usize> {
         let mut size = 0_usize;
 
@@ -153,6 +161,7 @@ impl IndexBuf {
 /// // Sync to disk.
 /// writer.flush().unwrap();
 /// ```
+/// 通过该对象操纵IndexBuf  负责将索引数据写入文件
 pub struct TsmWriter {
     tmp_path: PathBuf,
     final_path: PathBuf,
@@ -173,6 +182,7 @@ pub struct TsmWriter {
 }
 
 impl TsmWriter {
+
     pub async fn open(
         path: impl AsRef<Path>,
         sequence: u64,
@@ -205,10 +215,12 @@ impl TsmWriter {
         Ok(w)
     }
 
+    // 描述文件是否已经写完
     pub fn finished(&self) -> bool {
         self.finished
     }
 
+    // 根据是否已经写完 返回最终文件位置 或者临时文件位置
     pub fn path(&self) -> PathBuf {
         if self.finished {
             self.final_path.clone()
@@ -239,6 +251,7 @@ impl TsmWriter {
 
     /// Write a DataBlock to tsm file. If the max_size is greater than 0,
     /// then check if the current size exceeded, if so return Err(MaxFileSizeExceed).
+    /// 将数据块编码后写入数据文件  并且将获得的索引信息写入IndexBuf
     pub async fn write_block(
         &mut self,
         field_id: FieldId,
@@ -269,6 +282,7 @@ impl TsmWriter {
 
     /// Write a EncodedDataBlock to tsm file. If the max_size is greater than 0,
     /// then check if the current size exceeded, if so return Err(MaxFileSizeExceed).
+    /// 写入已经完成编码的数据块
     pub async fn write_encoded_block(
         &mut self,
         field_id: FieldId,
@@ -300,6 +314,7 @@ impl TsmWriter {
 
     /// Write a u8 slice to tsm file. If the max_size is greater than 0,
     /// then check if the current size exceeded, if so return Err(MaxFileSizeExceed).
+    /// 通过元数据的描述 写入原始数据相关的部分
     pub async fn write_raw(
         &mut self,
         block_meta: &BlockMeta,
@@ -327,6 +342,7 @@ impl TsmWriter {
         }
     }
 
+    // 将维护的索引数据写入文件
     pub async fn write_index(&mut self) -> WriteTsmResult<usize> {
         if self.finished {
             return Err(WriteTsmError::Finished {
@@ -364,10 +380,11 @@ impl TsmWriter {
     }
 }
 
+// 生成一个写入列式数据的对象
 pub async fn new_tsm_writer(
     dir: impl AsRef<Path>,
     tsm_sequence: u64,
-    is_delta: bool,
+    is_delta: bool,  // 是否为level0的数据
     max_size: u64,
 ) -> Result<TsmWriter> {
     let tsm_path = if is_delta {
@@ -378,6 +395,7 @@ pub async fn new_tsm_writer(
     TsmWriter::open(tsm_path, tsm_sequence, is_delta, max_size).await
 }
 
+// 写入header
 pub async fn write_header_to(writer: &mut FileCursor) -> WriteTsmResult<usize> {
     let size = writer
         .write_vec(
@@ -393,6 +411,7 @@ pub async fn write_header_to(writer: &mut FileCursor) -> WriteTsmResult<usize> {
     Ok(size)
 }
 
+// 借助元数据的描述信息 和原始数据
 async fn write_raw_data_to(
     writer: &mut FileCursor,
     index_buf: &mut IndexBuf,
@@ -421,6 +440,7 @@ async fn write_raw_data_to(
     Ok(size)
 }
 
+// 写入数据块信息 并产生一个索引信息
 async fn write_block_to(
     writer: &mut FileCursor,
     index_buf: &mut IndexBuf,
@@ -438,6 +458,7 @@ async fn write_block_to(
         .encode(0, block.len(), block.encodings())
         .context(EncodeSnafu)?;
 
+    // 写入数据块
     let size = writer
         .write_vec(
             [
@@ -457,6 +478,7 @@ async fn write_block_to(
             field_type: block.field_type(),
             blocks: vec![],
         },
+        // 产生该数据块的索引信息
         BlockEntry::with_block(block, offset, size as u64, ts_buf.len() as u64)
             .expect("data_block is not empty"),
     );
@@ -464,6 +486,7 @@ async fn write_block_to(
     Ok(size)
 }
 
+// 写入编码后的数据
 async fn write_encoded_block_to(
     writer: &mut FileCursor,
     index_buf: &mut IndexBuf,

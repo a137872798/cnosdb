@@ -20,6 +20,8 @@ pub struct Node {
     last_updated: Timestamp,
 }
 
+
+// 节点在上报自己的指标数据时 会告知自身是否处于健康状态
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Default, Clone)]
 pub enum NodeStatus {
     #[default]

@@ -58,12 +58,14 @@ type LevelId = u32;
 
 pub type EngineRef = Arc<dyn Engine>;
 
+// 表示一组kv
 #[derive(PartialEq, Eq, Hash)]
 pub struct UpdateSetValue<K, V> {
     pub key: K,
     pub value: Option<V>,
 }
 
+// 表示底层存储引擎开放的API
 #[async_trait]
 pub trait Engine: Send + Sync + Debug {
     /// Tskv engine write the gRPC message `WritePointsRequest`(which contains
@@ -221,6 +223,7 @@ pub trait Engine: Send + Sync + Debug {
     ) -> Result<()>;
 
     /// Read index of a storage unit, find series ids that matches the filter.
+    /// 查询该table相关的所有 series
     async fn get_series_id_by_filter(
         &self,
         tenant: &str,

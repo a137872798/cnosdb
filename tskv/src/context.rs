@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Default, Debug)]
 pub struct GlobalContext {
-    /// Database file id
+    /// Database file id   记录全局文件id
     file_id: AtomicU64,
 }
 

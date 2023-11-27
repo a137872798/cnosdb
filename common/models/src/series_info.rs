@@ -9,6 +9,7 @@ use crate::{tag, Tag, TagValue};
 
 #[derive(Serialize, Deserialize, Debug, Clone, Hash, PartialEq, Eq)]
 pub struct SeriesKey {
+    // 标签就是kv
     pub tags: Vec<Tag>,
     pub table: String,
 }

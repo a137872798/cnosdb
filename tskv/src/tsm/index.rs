@@ -14,7 +14,11 @@ use crate::ColumnFileId;
 
 #[derive(Debug, Clone)]
 pub struct Index {
+
+    // 索引数据所在的文件
     tsm_file_id: u64,
+
+    // 布隆过滤器 是可以快速判别某个东西是否一定不在的  (如果在 可能有误判的可能 如果不在 就是不存在)
     bloom_filter: Arc<BloomFilter>,
 
     /// In-memory index-block data
@@ -27,12 +31,16 @@ pub struct Index {
     /// | blocks      | -       |
     /// +-------------+---------+
     /// ```
+    /// 索引数据
     data: Vec<u8>,
     /// Sorted FieldId and it's offset if index-block
+    /// 记录每个字段在索引中的位置
     field_id_offs: Vec<(FieldId, usize)>,
 }
 
 impl Index {
+
+    // 初始化索引数据
     #[inline(always)]
     pub fn new(
         tsm_file_id: u64,
@@ -61,14 +69,17 @@ impl Index {
     }
 }
 
+// 记录索引的元数据  辅助Index使用
 pub struct IndexMeta {
     index_ref: Arc<Index>,
     /// Array index in `Index::offsets`
+    /// 代表此时正在访问的fieldId  可以去field_id_offs 兑换该字段相应的偏移量
     index_idx: usize,
     offset: usize,
 
     field_id: FieldId,
     field_type: ValueType,
+    /// 代表当前fieldId 相关的索引数据有多少块
     block_count: u16,
 }
 
@@ -84,6 +95,7 @@ impl IndexMeta {
     }
 
     /// get block_meta_iterator filter by time_ranges
+    /// 为迭代器 追加时间范围条件
     pub fn block_iterator_opt(&self, time_ranges: Arc<TimeRanges>) -> BlockMetaIterator {
         let mut iter = BlockMetaIterator::new(
             self.index_ref.clone(),
@@ -112,11 +124,18 @@ impl IndexMeta {
         self.block_count
     }
 
+
+    // 根据内部数据块信息 产生一个时间范围
     pub fn time_range(&self) -> TimeRange {
+
+        // 没有数据块信息 范围 MIN-MIN
         if self.block_count == 0 {
             return TimeRange::new(Timestamp::MIN, Timestamp::MIN);
         }
+
+        // INDEX_META_SIZE 估计是每个field相关索引的header数据长度
         let first_blk_beg = self.index_ref.field_id_offs()[self.index_idx].1 + INDEX_META_SIZE;
+        // 读取第一个block块数据 记录的是最小时间戳
         let min_ts = decode_be_i64(&self.index_ref.data[first_blk_beg..first_blk_beg + 8]);
         let last_blk_beg = first_blk_beg + BLOCK_META_SIZE * (self.block_count as usize - 1);
         let max_ts = decode_be_i64(&self.index_ref.data[last_blk_beg + 8..last_blk_beg + 16]);
@@ -124,16 +143,25 @@ impl IndexMeta {
     }
 }
 
+
+// 单个数据块的索引元数据信息
 #[derive(Debug, Clone)]
 pub struct BlockMeta {
+
+    /// 代表这些数据是从哪个index中加载出来的
     index_ref: Arc<Index>,
     /// Array index in `Index::data` which current `BlockMeta` starts.
     field_id: FieldId,
+
+    // 该block块在整个索引的偏移量
     block_offset: usize,
+    // 该数据块对应的列数据类型
     field_type: ValueType,
 
+    // 该数据块的时间戳
     min_ts: Timestamp,
     max_ts: Timestamp,
+    // 该数据块下有多少列数据
     count: u32,
 }
 
@@ -168,12 +196,16 @@ impl Ord for BlockMeta {
 }
 
 impl BlockMeta {
+
+    // 描述如何初始化一个block的元数据
     fn new(
         index: Arc<Index>,
         field_id: FieldId,
         field_type: ValueType,
         block_offset: usize,
     ) -> Self {
+
+        // 当进入到一个block的索引数据时 连续2个 8字节 和 一个4字节
         let min_ts = decode_be_i64(&index.data()[block_offset..block_offset + 8]);
         let max_ts = decode_be_i64(&index.data()[block_offset + 8..block_offset + 16]);
         let count = decode_be_u32(&index.data()[block_offset + 16..block_offset + 20]);
@@ -226,6 +258,7 @@ impl BlockMeta {
         self.count
     }
 
+    // 这个偏移量应该是在数据文件的位置
     #[inline(always)]
     pub fn offset(&self) -> u64 {
         decode_be_u64(&self.index_ref.data()[self.block_offset + 20..self.block_offset + 28])
@@ -260,9 +293,13 @@ impl Display for BlockMeta {
     }
 }
 
+// 代表解析第几个field的索引数据 并得到 IndexMeta
 pub(crate) fn get_index_meta_unchecked(index: Arc<Index>, idx: usize) -> IndexMeta {
+    // 找到该field对应的起始偏移量
     let (field_id, off) = unsafe { *index.field_id_offs.get_unchecked(idx) };
+    // 头8个字节 表示类型
     let block_type = ValueType::from(index.data()[off + 8]);
+    // 表示该索引记录了多少个数据块 每个数据块由n个列数据组成
     let block_count = decode_be_u16(&index.data()[off + 9..off + 11]);
 
     IndexMeta {
@@ -275,10 +312,11 @@ pub(crate) fn get_index_meta_unchecked(index: Arc<Index>, idx: usize) -> IndexMe
     }
 }
 
+// 初始化 BlockMeta
 pub(crate) fn get_data_block_meta_unchecked(
     index: Arc<Index>,
-    index_offset: usize,
-    block_idx: usize,
+    index_offset: usize,  // 对应某个field的起始偏移量
+    block_idx: usize,  // 代表要读取第几个block
     field_id: FieldId,
     field_type: ValueType,
 ) -> BlockMeta {
@@ -286,11 +324,12 @@ pub(crate) fn get_data_block_meta_unchecked(
     BlockMeta::new(index, field_id, field_type, base)
 }
 
+// 索引数据在写入文件前就是实体    该级别相当于某一列
 #[derive(Debug)]
 pub(crate) struct IndexEntry {
-    pub field_id: FieldId,
-    pub field_type: ValueType,
-    pub blocks: Vec<BlockEntry>,
+    pub field_id: FieldId,  // 对应的列
+    pub field_type: ValueType,   // 列数据类型
+    pub blocks: Vec<BlockEntry>,  // 列数据被划分为多个block  这里每个block对应一个entry
 }
 
 impl IndexEntry {
@@ -321,6 +360,7 @@ impl IndexEntry {
     }
 }
 
+// 同上  block数据在写入索引前 就是作为blockEntry存储在内存中的
 #[derive(Debug)]
 pub(crate) struct BlockEntry {
     pub min_ts: Timestamp,
@@ -347,7 +387,7 @@ impl BlockEntry {
     pub fn with_block(
         data_block: &DataBlock,
         offset: u64,
-        size: u64,
+        size: u64,  // 编码后的总大小
         encoded_ts_size: u64,
     ) -> Option<Self> {
         if data_block.is_empty() {
@@ -358,9 +398,10 @@ impl BlockEntry {
             min_ts: ts_sli[0],
             max_ts: ts_sli[ts_sli.len() - 1],
             count: ts_sli.len() as u32,
-            offset,
+            offset,  // 整个block数据的起始偏移量
             size,
             // Encoded timestamps block need a 4-bytes crc checksum together.
+            // value的偏移量
             val_offset: offset + encoded_ts_size + 4,
         })
     }

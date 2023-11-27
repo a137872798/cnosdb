@@ -13,8 +13,10 @@ use crate::error::{MetaError, MetaResult};
 use crate::store::command::*;
 use crate::store::storage::{BtreeMapSnapshotData, StateMachine};
 
+// 元数据服务器支持多节点  也可以单机运行
 pub async fn start_singe_meta_server(path: String, cluster_name: String, addr: String) {
     let db_path = format!("{}/meta/{}.data", path, 0);
+    // 在服务器上打开目录作为存储各种元数据的db
     let storage = StateMachine::open(db_path).unwrap();
 
     let init_data = crate::store::config::MetaInit {
@@ -26,8 +28,10 @@ pub async fn start_singe_meta_server(path: String, cluster_name: String, addr: S
             models::schema::DEFAULT_DATABASE.to_string(),
         ],
     };
+    // 使用初始数据 初始化服务器
     super::init::init_meta(&storage, init_data).await;
 
+    // 状态机是用来接收各种请求的
     let storage = Arc::new(RwLock::new(storage));
     let server = SingleServer { storage };
     tracing::info!("single meta http server start addr: {}", addr);
@@ -44,6 +48,7 @@ impl SingleServer {
         warp::serve(self.routes()).run(addr).await;
     }
 
+    // 设置路由信息
     fn routes(
         &self,
     ) -> impl Filter<Extract = (impl warp::Reply,), Error = warp::Rejection> + Clone {
@@ -204,11 +209,13 @@ impl SingleServer {
 
         let mut notify = {
             let storage = storage.read().await;
+            // 代表偏移量之后的数据已经产生 直接返回
             let watch_data = storage.read_change_logs(&cluster, &tenants, base_ver);
             if watch_data.need_return(base_ver) {
                 return Ok(crate::store::storage::response_encode(Ok(watch_data)));
             }
 
+            // 还未产生的情况下 产生一个监听者 等待新日志的加入
             storage.watch.subscribe()
         };
 

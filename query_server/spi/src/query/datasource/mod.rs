@@ -14,14 +14,21 @@ pub mod gcs;
 pub mod s3;
 pub mod stream;
 
+// 与oss 交互使用的上下文
 pub struct WriteContext {
+    // 指向oss的位置
     location: Path,
+    // 该任务用于将数据写入到 oss
     task_id: String,
+    // 指定分区
     partition: usize,
+    // 文件拓展名
     file_extension: String,
 }
 
 impl WriteContext {
+
+    // 将相关信息收集起来 就是 context
     pub fn new(
         location: Path,
         task_id: Option<String>,
@@ -77,10 +84,14 @@ impl From<&str> for UriSchema {
     }
 }
 
+
+// 根据连接信息 产生连接
 pub fn build_object_store(
     options: ConnectionOptions,
 ) -> Result<Option<Arc<dyn ObjectStore>>, object_store::Error> {
     let object_store: Option<Arc<dyn ObjectStore>> = match options {
+
+        // 相关的oss都开放了api 可以直接调用
         ConnectionOptions::S3(config) => Some(Arc::new(AmazonS3Builder::from(config).build()?)),
         ConnectionOptions::Gcs(ref config) => {
             Some(Arc::new(GoogleCloudStorageBuilder::from(config).build()?))

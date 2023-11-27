@@ -37,6 +37,7 @@ pub struct Opt {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    // 忽略链路追踪的
     tracing_subscriber::fmt()
         .with_file(true)
         .with_line_number(true)
@@ -49,6 +50,7 @@ async fn main() -> std::io::Result<()> {
 
     info!("service start option: {:?}", options);
 
+    // 使用配置项初始化raft节点
     start_raft_node(options.id, options.http_addr)
         .await
         .unwrap();
@@ -56,9 +58,11 @@ async fn main() -> std::io::Result<()> {
     Ok(())
 }
 
+// raft节点需要启动grpc服务 这样可以接收leader的一些请求
 async fn start_raft_node(id: RaftNodeId, http_addr: String) -> ReplicationResult<()> {
     let path = format!("/tmp/cnosdb/{}", id);
 
+    // 分别是处理请求/保存日志/保存状态的3个storage
     let state = StateStorage::open(format!("{}-state", path))?;
     let entry = HeedEntryStorage::open(format!("{}-entry", path))?;
     let engine = HeedApplyStorage::open(format!("{}-engine", path))?;
@@ -102,8 +106,11 @@ async fn start_raft_node(id: RaftNodeId, http_addr: String) -> ReplicationResult
 }
 
 // **************************** http and grpc server ************************************** //
+// 启动grpc服务
 async fn start_warp_grpc_server(addr: String, node: RaftNode) -> ReplicationResult<()> {
     let node = Arc::new(node);
+
+    // 这个对象相当于是raft接口的代理对象
     let raft_admin = RaftHttpAdmin::new(node.clone());
     let http_server = HttpServer {
         node: node.clone(),
@@ -159,6 +166,7 @@ struct HttpServer {
 
 //  let res: Result<String, warp::Rejection> = Ok(data);
 //  warp::reply::Response::new(hyper::Body::from(data))
+// 开放http协议接收请求
 impl HttpServer {
     fn routes(
         &self,
@@ -203,6 +211,8 @@ impl HttpServer {
 
                 let engine = node.apply_store();
                 let engine = Arc::downcast::<HeedApplyStorage>(engine).unwrap();
+
+                // 就是简单的查询kv值
                 let rsp = engine
                     .get(&req)
                     .map_or_else(|err| Some(err.to_string()), |v| v)
@@ -219,6 +229,7 @@ impl HttpServer {
             .and(warp::body::bytes())
             .and(self.with_raft_node())
             .and_then(|req: hyper::body::Bytes, node: Arc<RaftNode>| async move {
+                // read操作都是可以从 follower读取的  而write操作则要提交给leader 并通过leader同步到其他follower  最后会触发apply_to_state_machine
                 let rsp = node.raw_raft().client_write(req.to_vec()).await;
                 let data = serde_json::to_string(&rsp)
                     .map_err(ReplicationError::from)

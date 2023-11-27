@@ -18,6 +18,7 @@ const MAX_VAR_INT_64: usize = 10;
 
 /// Combined encoding ids with timestamp-block-encoding (high 4 bit)
 /// and values-block-encoding (low 4 bit)
+/// 描述时间和value的编码方式
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DataBlockEncoding {
     ts_encoding: Encoding,

@@ -86,16 +86,25 @@ const AUTO_INCR_ID_KEY: &str = "_auto_incr_id";
 ///     _id_SeriesId-2 -> SeriesKey2
 /// ```
 pub struct TSIndex {
+
+    // 存储路径信息
     path: PathBuf,
+    // 下一个数据的id
     incr_id: AtomicU32,
+    // 当前已经写入的数量
     write_count: AtomicU32,
 
+    // 通过该对象进行binlog的读写  binlog记录的是有关series的变化
     binlog: Arc<RwLock<IndexBinlog>>,
+    // 利用基数树 存储索引信息  并且存储的是倒排索引 (由第三方库实现)
     storage: Arc<RwLock<IndexEngine>>,
+    // 正向缓存 直接存储seriesId 与 series table/tag 信息
     forward_cache: ForwardIndexCache,
+    // 通知监听binlog的对象
     binlog_change_sender: UnboundedSender<()>,
 }
 
+// TsIndex 维护了需要的各种索引
 impl TSIndex {
     pub async fn new(path: impl AsRef<Path>) -> IndexResult<Arc<Self>> {
         let path = path.as_ref();
@@ -103,6 +112,7 @@ impl TSIndex {
         let binlog = IndexBinlog::new(path).await?;
         let storage = IndexEngine::new(path)?;
 
+        // 可能有残留数据
         let incr_id = match storage.get(AUTO_INCR_ID_KEY.as_bytes())? {
             Some(data) => byte_utils::decode_be_u32(&data),
             None => 0,
@@ -120,8 +130,11 @@ impl TSIndex {
             binlog_change_sender,
         };
 
+        // 在启动时 先通过binlog文件重建索引
         ts_index.recover().await?;
         let ts_index = Arc::new(ts_index);
+
+        // 运行后台任务监听binlog的变化 每次针对series的操作会写入到binlog中 然后在后台构建索引
         run_index_job(ts_index.clone(), binlog_change_reciver);
         info!(
             "Recovered index dir '{}', incr_id start at: {incr_id}",
@@ -131,10 +144,14 @@ impl TSIndex {
         Ok(ts_index)
     }
 
+    // 尝试恢复数据
     async fn recover(&mut self) -> IndexResult<()> {
         let path = self.path.clone();
+        // 遍历该目录下所有文件
         let files = file_manager::list_file_names(&path);
         for filename in files.iter() {
+
+            // 读取binlog文件
             if let Ok(file_id) = file_utils::get_index_binlog_file_id(filename) {
                 let file_path = path.join(filename);
                 info!("Recovering index binlog: '{}'", file_path.display());
@@ -147,8 +164,12 @@ impl TSIndex {
         Ok(())
     }
 
+    // 写入binlog数据
     async fn write_binlog(&self, blocks: &[IndexBinlogBlock]) -> IndexResult<()> {
+
+        // 通过 binlog对象 与底层文件交互
         self.binlog.write().await.write_blocks(blocks).await?;
+        // 发送消息通知后台任务
         self.binlog_change_sender
             .send(())
             .map_err(|e| IndexError::IndexStroage {
@@ -169,17 +190,22 @@ impl TSIndex {
         self.storage.write().await.delete(&key_buf)
     }
 
+    // 这里只是构建series的索引信息  因为本对象只是一个索引
     async fn add_series(&self, id: SeriesId, series_key: &SeriesKey) -> IndexResult<()> {
         let mut storage_w = self.storage.write().await;
 
+        // 对series数据进行编码 并写入到buf  这个就是倒排索引  通过table，tags反查 series
         let key_buf = encode_series_key(series_key.table(), series_key.tags());
         storage_w.set(&key_buf, &id.to_be_bytes())?;
+        // 这里是正向查询
         storage_w.set(&encode_series_id_key(id), &series_key.encode())?;
 
         for tag in series_key.tags() {
+            // 按照标签来构建倒排索引  因为标签是很容易重复的 所以这里用modify 将不同的id追加到倒排索引结构
             let key = encode_inverted_index_key(series_key.table(), &tag.key, &tag.value);
             storage_w.modify(&key, id, true)?;
         }
+        // 空的标签也算一种key
         if series_key.tags().is_empty() {
             let key = encode_inverted_index_key(series_key.table(), &[], &[]);
             storage_w.modify(&key, id, true)?;
@@ -188,24 +214,31 @@ impl TSIndex {
         Ok(())
     }
 
+    // 从binlog文件中恢复数据
     async fn recover_from_file(&mut self, reader_file: &mut BinlogReader) -> IndexResult<()> {
         let mut max_id = self.incr_id.load(Ordering::Relaxed);
         while let Some(block) = reader_file.next_block().await? {
             match block {
+
+                // 读取数据块
                 IndexBinlogBlock::Add(blocks) => {
                     for block in blocks {
-                        // add series
+                        // 使用series的数据构建索引
                         self.add_series(block.series_id(), block.data()).await?;
 
+                        // 更新当前id
                         if max_id < block.series_id() {
                             max_id = block.series_id()
                         }
                     }
                 }
+                // 删除索引
                 IndexBinlogBlock::Delete(block) => {
                     // delete series
                     self.del_series_id_from_engine(block.series_id()).await?;
                 }
+
+                // series数据发生了变化  用它更新倒排索引
                 IndexBinlogBlock::Update(block) => {
                     let series_id = block.series_id();
                     let new_series_key = block.new_series();
@@ -219,17 +252,22 @@ impl TSIndex {
                         old_series_key,
                     );
 
+                    // 代表这个block块是在什么时候添加的
                     self.del_series_id_from_engine(series_id).await?;
                     if recovering {
                         self.remove_deleted_series(old_series_key).await?;
                     } else {
                         // The modified key can be found when restarting and recover wal.
+                        // deleted的数据 前缀是不一样的
                         self.add_deleted_series(series_id, old_series_key).await?;
                     }
+                    // 为新的table/tag构建正向/倒排索引
                     self.add_series(series_id, new_series_key).await?;
                 }
             }
         }
+
+        // 此时已经完成了从binlog重建缓存的工作了 更新最大记录的id
         self.incr_id.store(max_id, Ordering::Relaxed);
 
         let id_bytes = self.incr_id.load(Ordering::Relaxed).to_be_bytes();
@@ -237,12 +275,15 @@ impl TSIndex {
             .write()
             .await
             .set(AUTO_INCR_ID_KEY.as_bytes(), &id_bytes)?;
+
+        // 对索引数据进行刷盘
         self.storage.write().await.flush()?;
         reader_file.advance_read_offset(0).await?;
 
         Ok(())
     }
 
+    // 获取被标记成删除的 series
     pub async fn get_deleted_series_id(&self, series_key: &SeriesKey) -> IndexResult<Option<u32>> {
         let key_buf = encode_deleted_series_key(series_key.table(), series_key.tags());
         if let Some(val) = self.storage.read().await.get(&key_buf)? {
@@ -254,13 +295,16 @@ impl TSIndex {
     }
 
     pub async fn get_series_id(&self, series_key: &SeriesKey) -> IndexResult<Option<u32>> {
+        // 通过hash加速查询
         if let Some(id) = self.forward_cache.get_series_id_by_key(series_key) {
             return Ok(Some(id));
         }
 
+        // 未找到的情况下 利用倒排索引查询
         let key_buf = encode_series_key(series_key.table(), series_key.tags());
         if let Some(val) = self.storage.read().await.get(&key_buf)? {
             let id = byte_utils::decode_be_u32(&val);
+            // 并加入到正向查询缓存 加速下次查询
             self.forward_cache.add(id, series_key.clone());
 
             return Ok(Some(id));
@@ -270,6 +314,7 @@ impl TSIndex {
     }
 
     pub async fn get_series_key(&self, sid: SeriesId) -> IndexResult<Option<SeriesKey>> {
+        // 先通过正向缓存 使用id 查询key信息
         if let Some(key) = self.forward_cache.get_series_key_by_id(sid) {
             return Ok(Some(key));
         }
@@ -279,6 +324,7 @@ impl TSIndex {
             let key = SeriesKey::decode(&res)
                 .map_err(|e| IndexError::DecodeSeriesKey { msg: e.to_string() })?;
 
+            // 加入到缓存中 加速下次查询
             self.forward_cache.add(sid, key.clone());
 
             return Ok(Some(key));
@@ -287,6 +333,7 @@ impl TSIndex {
         Ok(None)
     }
 
+    // 仅当series数据不存在时 触发添加
     pub async fn add_series_if_not_exists(
         &self,
         series_keys: Vec<SeriesKey>,
@@ -297,27 +344,34 @@ impl TSIndex {
             let key_buf = encode_series_key(series_key.table(), series_key.tags());
             {
                 let mut storage_w = self.storage.write().await;
+
+                // 先查看 table/tag 能否检索到数据  存在的情况下 加入到ids
                 if let Some(val) = storage_w.get(&key_buf)? {
                     ids.push(byte_utils::decode_be_u32(&val));
                     continue;
                 }
+
+                // 还不存在该series数据
                 let id = self.incr_id.fetch_add(1, Ordering::Relaxed) + 1;
+                // 先写缓存 后写 binlog
                 storage_w.set(&key_buf, &id.to_be_bytes())?;
                 let block = AddSeries::new(utils::now_timestamp_nanos(), id, series_key.clone());
                 ids.push(id);
                 blocks_data.push(block);
 
-                // write cache
+                // write cache  顺便加入到正向缓存
                 self.forward_cache.add(id, series_key);
             }
         }
 
+        // 写入binlog
         self.write_binlog(&[IndexBinlogBlock::Add(blocks_data)])
             .await?;
 
         Ok(ids)
     }
 
+    // 检查是否需要刷盘
     async fn check_to_flush(&self, force: bool) -> IndexResult<()> {
         let count = self.write_count.fetch_add(1, Ordering::Relaxed);
         if !force && count < 20000 {
@@ -326,6 +380,7 @@ impl TSIndex {
 
         let mut storage_w = self.storage.write().await;
         let id_bytes = self.incr_id.load(Ordering::Relaxed).to_be_bytes();
+        // 记录最新id 并手动刷盘
         storage_w.set(AUTO_INCR_ID_KEY.as_bytes(), &id_bytes)?;
         storage_w.flush()?;
 
@@ -338,7 +393,11 @@ impl TSIndex {
 
         let log_dir = self.path.clone();
         let files = file_manager::list_file_names(&log_dir);
+
+        // 因为索引数据已经写入磁盘了 旧的binlog就不需要了
         for filename in files.iter() {
+
+            // 其余binlog文件要删除
             if let Ok(file_id) = file_utils::get_index_binlog_file_id(filename) {
                 if current_id != file_id {
                     let _ = std::fs::remove_file(log_dir.join(filename));
@@ -351,10 +410,12 @@ impl TSIndex {
         Ok(())
     }
 
+    // 将删除series的操作作用到缓存上
     pub async fn del_series_info(&self, sid: u32) -> IndexResult<()> {
         // first write binlog
         let block = IndexBinlogBlock::Delete(DeleteSeries::new(sid));
 
+        // 写入binlog 同时发送消息
         self.write_binlog(&[block]).await?;
         // TODO @Subsegment only delete mapping: key -> sid
         // then delete forward index and inverted index
@@ -365,10 +426,15 @@ impl TSIndex {
         Ok(())
     }
 
+    // 删除某个series相关的索引
     async fn del_series_id_from_engine(&self, sid: u32) -> IndexResult<()> {
         let mut storage_w = self.storage.write().await;
+
+        // 先尝试从正向索引读取 seriesKey的数据
         let series_key = match self.forward_cache.get_series_key_by_id(sid) {
             Some(k) => Some(k),
+
+            // 在倒排索引中也存储了一份正向数据
             None => match storage_w.get(&encode_series_id_key(sid))? {
                 Some(res) => {
                     let key = SeriesKey::decode(&res)
@@ -378,9 +444,13 @@ impl TSIndex {
                 None => None,
             },
         };
+
+        // 删除正向数据
         let _ = storage_w.delete(&encode_series_id_key(sid));
         if let Some(series_key) = series_key {
+            // 删除缓存中数据
             self.forward_cache.del(sid, series_key.hash());
+            // 删除倒排数据
             let key_buf = encode_series_key(series_key.table(), series_key.tags());
             let _ = storage_w.delete(&key_buf);
             for tag in series_key.tags() {
@@ -392,17 +462,21 @@ impl TSIndex {
         Ok(())
     }
 
+    // 根据领域来获取series
     pub async fn get_series_ids_by_domains(
         &self,
-        tab: &str,
+        tab: &str,  // 这个应该是table的意思
         tag_domains: &ColumnDomains<String>,
     ) -> IndexResult<Vec<u32>> {
+
+        // 代表匹配所有记录 不传标签
         if tag_domains.is_all() {
             // Match all records
             debug!("pushed tags filter is All.");
             return self.get_series_id_list(tab, &[]).await;
         }
 
+        // domain为空 返回空值
         if tag_domains.is_none() {
             // Does not match any record, return null
             debug!("pushed tags filter is None.");
@@ -410,12 +484,15 @@ impl TSIndex {
         }
 
         // safe: tag_domains is not empty
+        // 除开特殊情况后 读取domain的信息
         let domains = unsafe { tag_domains.domains_unsafe() };
 
         debug!("Index get sids: pushed tag_domains: {:?}", domains);
         let mut series_ids = vec![];
+        // 每个domain的结果分开存储
         for (k, v) in domains.iter() {
             let rb = self.get_series_ids_by_domain(tab, k, v).await?;
+            // 每个domain相关的分开存储
             series_ids.push(rb);
         }
 
@@ -424,6 +501,7 @@ impl TSIndex {
             series_ids
         );
 
+        // 将所有id叠在一起
         let result = series_ids
             .into_iter()
             .reduce(|p, c| p.bitand(c))
@@ -434,18 +512,24 @@ impl TSIndex {
         Ok(result)
     }
 
+    // 通过标签反查所有 seriesId
     pub async fn get_series_id_list(&self, tab: &str, tags: &[Tag]) -> IndexResult<Vec<u32>> {
         let res = self.get_series_id_bitmap(tab, tags).await?.iter().collect();
         Ok(res)
     }
 
+    // 通过标签 利用倒排索引反查所有系列id
     pub async fn get_series_id_bitmap(
         &self,
         tab: &str,
         tags: &[Tag],
     ) -> IndexResult<roaring::RoaringBitmap> {
+
+        // 使用位图记录id
         let mut bitmap = roaring::RoaringBitmap::new();
         let storage_r = self.storage.read().await;
+
+        // 代表查找所有标签  使用前缀查找
         if tags.is_empty() {
             let prefix = format!("{}.", tab);
             let it = storage_r.prefix(prefix.as_bytes())?;
@@ -456,6 +540,7 @@ impl TSIndex {
                 bitmap = bitmap.bitor(rb);
             }
         } else {
+            // 通过table/tab 生成key
             let key = encode_inverted_index_key(tab, &tags[0].key, &tags[0].value);
             if let Some(rb) = storage_r.get_rb(&key)? {
                 bitmap = rb;
@@ -464,6 +549,7 @@ impl TSIndex {
             for tag in &tags[1..] {
                 let key = encode_inverted_index_key(tab, &tag.key, &tag.value);
                 if let Some(rb) = storage_r.get_rb(&key)? {
+                    // 追加到位图上
                     bitmap = bitmap.bitand(rb);
                 } else {
                     return Ok(roaring::RoaringBitmap::new());
@@ -474,6 +560,7 @@ impl TSIndex {
         Ok(bitmap)
     }
 
+    // 查询该标签key 相关的所有数据 (也就是没有指定标签value)
     pub async fn get_series_ids_by_tag_key(
         &self,
         tab: &str,
@@ -498,6 +585,7 @@ impl TSIndex {
         Ok(series_ids)
     }
 
+    // 查询某个domain相关的seriesId
     pub async fn get_series_ids_by_domain(
         &self,
         tab: &str,
@@ -506,11 +594,18 @@ impl TSIndex {
     ) -> IndexResult<roaring::RoaringBitmap> {
         let mut bitmap = roaring::RoaringBitmap::new();
         match v {
+
+            // 代表标签key 关联的一个范围
             Domain::Range(range_set) => {
                 let storage_r = self.storage.read().await;
+
+                // 多个范围
                 for (_, range) in range_set.low_indexed_ranges().into_iter() {
+                    // 生成查询条件
                     let key_range = filter_range_to_index_key_range(tab, tag_key, range);
                     let (is_equal, equal_key) = is_equal_value(&key_range);
+
+                    // bound范围内只有一个值 简单查询
                     if is_equal {
                         if let Some(rb) = storage_r.get_rb(&equal_key)? {
                             bitmap = bitmap.bitor(rb);
@@ -520,6 +615,7 @@ impl TSIndex {
                     }
 
                     // Search the sid list corresponding to qualified tags in the range
+                    // 指定范围产生一个迭代器 遍历id
                     let iter = storage_r.range(key_range);
                     for item in iter {
                         let item = item?;
@@ -530,6 +626,8 @@ impl TSIndex {
             }
             Domain::Equtable(val) => {
                 let storage_r = self.storage.read().await;
+
+                // 代表查询包含在内的
                 if val.is_white_list() {
                     // Contains the given value
                     for entry in val.entries().into_iter() {
@@ -541,6 +639,7 @@ impl TSIndex {
                 } else {
                     // Does not contain a given value, that is, a value other than a given value
                     // TODO will not deal with this situation for the time being
+                    // 代表忽略包含在内的  目前未实现
                     bitmap = self.get_series_id_bitmap(tab, &[]).await?;
                 }
             }
@@ -563,6 +662,7 @@ impl TSIndex {
         self.path.clone()
     }
 
+    // 刷新索引数据到文件
     pub async fn flush(&self) -> IndexResult<()> {
         self.check_to_flush(true).await?;
 
@@ -594,6 +694,7 @@ impl TSIndex {
             })
             .collect::<Vec<_>>();
 
+        // 将改动写入binlog
         self.write_binlog(&blocks).await?;
 
         // Only delete old index, not add new index
@@ -608,11 +709,13 @@ impl TSIndex {
     /// (old_series_keys, new_series_keys, sids)
     pub async fn prepare_update_tags_value(
         &self,
-        new_tags: &[UpdateSetValue<TagKey, TagValue>],
-        matched_series: &[SeriesKey],
+        new_tags: &[UpdateSetValue<TagKey, TagValue>],  // 一组要使用的新标签
+        matched_series: &[SeriesKey],  // 作用在这些series上
     ) -> IndexResult<(Vec<SeriesKey>, Vec<SeriesKey>, Vec<SeriesId>)> {
         // Find all matching series ids
         let mut ids = vec![];
+
+        // 获取就的标签
         let mut old_keys = vec![];
         for key in matched_series {
             if let Some(sid) = self.get_series_id(key).await? {
@@ -621,17 +724,19 @@ impl TSIndex {
             }
         }
 
+        // 存储所有合并后的新标签
         let mut new_keys = vec![];
         let mut new_keys_set = HashSet::new();
         for key in &old_keys {
             // modify tag value
+            // 收集旧的标签
             let mut old_tags = key
                 .tags
                 .iter()
                 .map(|Tag { key, value }| (key, Some(value.as_ref())))
                 .collect::<HashMap<_, _>>();
 
-            // 更新 tag value
+            // 这是组合后的新标签
             for UpdateSetValue { key, value } in new_tags {
                 old_tags.insert(key, value.as_deref());
             }
@@ -643,12 +748,14 @@ impl TSIndex {
 
             tag::sort_tags(&mut tags);
 
+            // 产生新标签
             let new_key = SeriesKey {
                 tags,
                 table: key.table.clone(),
             };
 
             // check conflict
+            // 已经存在认为是异常情况
             if self.get_series_id(&new_key).await?.is_some() {
                 trace::warn!("Series already exists: {:?}", new_key);
                 return Err(IndexError::SeriesAlreadyExists {
@@ -661,7 +768,7 @@ impl TSIndex {
 
         new_keys_set.extend(new_keys.clone());
 
-        // 检查新生成的series key是否有重复key
+        // 检查新生成的series key是否有重复key    代表出现了重复的标签
         if new_keys_set.len() != new_keys.len() {
             return Err(IndexError::SeriesAlreadyExists {
                 key: "new series keys".to_string(),
@@ -671,28 +778,36 @@ impl TSIndex {
         Ok((old_keys, new_keys, ids))
     }
 
+    // 重命名标签
     pub async fn rename_tag(
         &self,
         table: &str,
         old_tag_name: &TagKey,
         new_tag_name: &TagKey,
-        dry_run: bool,
+        dry_run: bool,  // 代表只是进行检查
     ) -> IndexResult<()> {
         // Find all matching series ids
+        // 查询旧标签关联的一组系列
         let ids = self.get_series_ids_by_tag_key(table, old_tag_name).await?;
 
         if ids.is_empty() {
             return Ok(());
         }
 
+        // 存储新生成的key
         let mut new_keys = vec![];
         let mut waiting_delete_series = vec![];
+
+        // 遍历每个系列id
         for sid in &ids {
+
+            // 查看此时的标签 (key 就是由table和tab合成的)
             if let Some(mut key) = self.get_series_key(*sid).await? {
                 let old_key_hash = key.hash();
+                // 旧标签相关的这些系列会受到影响
                 waiting_delete_series.push((*sid, old_key_hash));
 
-                // modify tag key
+                // modify tag key  修改标签名
                 for tag in key.tags.iter_mut() {
                     if &tag.key == old_tag_name {
                         tag.key = new_tag_name.clone();
@@ -716,6 +831,7 @@ impl TSIndex {
         }
 
         // write binlog
+        // 生成更新操作
         let mut blocks = vec![];
         for (sid, key) in ids.into_iter().zip(new_keys.into_iter()) {
             if let Some(old_key) = self.get_series_key(sid).await? {
@@ -755,6 +871,7 @@ pub fn is_equal_value(range: &impl RangeBounds<Vec<u8>>) -> (bool, Vec<u8>) {
     (false, vec![])
 }
 
+// 根据范围查询
 pub fn filter_range_to_index_key_range(
     tab: &str,
     tag_key: &str,
@@ -764,6 +881,7 @@ pub fn filter_range_to_index_key_range(
     let end_bound = range.end_bound();
 
     // Convert ScalarValue value to inverted index key
+    // 将范围中的每个值都变成一个key
     let generate_index_key = |v: &ScalarValue| tag_value_to_index_key(tab, tag_key, v);
 
     // Convert the tag value in Bound to the inverted index key
@@ -894,12 +1012,19 @@ pub fn encode_series_id_list(list: &[u32]) -> Vec<u8> {
     data
 }
 
+// 运行一个后台任务
 pub fn run_index_job(ts_index: Arc<TSIndex>, mut binlog_change_reciver: UnboundedReceiver<()>) {
     tokio::spawn(async move {
         let path = ts_index.path.clone();
+
+        // 记录每个binlog文件此时处理到的偏移量
         let mut handle_file = HashMap::new();
+
+        // 接收binlog日志 并进行处理
         while (binlog_change_reciver.recv().await).is_some() {
             let files = file_manager::list_file_names(&path);
+
+            // 遍历所有文件
             for filename in files.iter() {
                 if let Ok(file_id) = file_utils::get_index_binlog_file_id(filename) {
                     let file_path = path.join(filename);
@@ -915,6 +1040,7 @@ pub fn run_index_job(ts_index: Arc<TSIndex>, mut binlog_change_reciver: Unbounde
                         }
                     };
 
+                    // 已经处理过了
                     if file.len() <= *handle_file.get(&file_id).unwrap_or(&0) {
                         continue;
                     }
@@ -930,6 +1056,8 @@ pub fn run_index_job(ts_index: Arc<TSIndex>, mut binlog_change_reciver: Unbounde
                             continue;
                         }
                     };
+
+                    // 定位到上次处理的位置
                     if let Some(pos) = handle_file.get(&file_id) {
                         let res = reader_file.seek(*pos);
                         if let Err(e) = res {
@@ -940,12 +1068,16 @@ pub fn run_index_job(ts_index: Arc<TSIndex>, mut binlog_change_reciver: Unbounde
                             );
                         }
                     }
+
+                    // 不断的读取binlog数据块
                     while let Ok(Some(block)) = reader_file.next_block().await {
                         if reader_file.pos() <= *handle_file.get(&file_id).unwrap_or(&0) {
                             continue;
                         }
 
                         match block {
+
+                            // 根据不同类型 走不同处理逻辑
                             IndexBinlogBlock::Add(blocks) => {
                                 for block in blocks {
                                     let _ = ts_index
@@ -984,6 +1116,8 @@ pub fn run_index_job(ts_index: Arc<TSIndex>, mut binlog_change_reciver: Unbounde
                                     .map_err(|err| {
                                         error!("Delete series failed for Update, err: {}", err);
                                     });
+
+                                // 代表此时正处于 启动 tskv 并恢复数据的阶段
                                 if recovering {
                                     // 清理标记为删除状态的series key
                                     let _ = ts_index

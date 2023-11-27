@@ -51,6 +51,7 @@ pub async fn get_files_meta(dir: &str) -> CoordinatorResult<PathFilesMeta> {
     })
 }
 
+// 在本地打开目标文件 并读取元数据
 pub async fn get_file_info(name: &str) -> CoordinatorResult<FileInfo> {
     let mut file = File::open(name).await?;
     let file_meta = file.metadata().await?;

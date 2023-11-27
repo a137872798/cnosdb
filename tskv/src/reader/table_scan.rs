@@ -14,6 +14,7 @@ use crate::{EngineRef, Error};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
+// 这个应该是扫描表数据的
 pub struct LocalTskvTableScanStream {
     state: StreamState,
     #[allow(unused)]
@@ -24,8 +25,8 @@ impl LocalTskvTableScanStream {
     pub fn new(
         vnode_id: VnodeId,
         option: QueryOption,
-        kv_inst: EngineRef,
-        runtime: Arc<Runtime>,
+        kv_inst: EngineRef,   // 提供与库表/数据交互的api
+        runtime: Arc<Runtime>,  // tokio的运行时环境
         span_recorder: SpanRecorder,
     ) -> Self {
         let iter_future = Box::pin(RowIterator::new(

@@ -26,10 +26,16 @@ use crate::{file_utils, Error, Result};
 //         AsyncRuntime = openraft::TokioRuntime,
 // );
 
+// 对应raft协议的一条日志
 pub type RaftEntry = openraft::Entry<TypeConfig>;
+
+// 描述当前raft group的所有成言
 pub type RaftLogMembership = openraft::Membership<RaftNodeId, RaftNodeInfo>;
+
+// 在writer中使用的task
 pub type RaftRequestForWalWrite = writer::Task;
 
+// 将数据解析成 openraft::Entry
 pub fn new_raft_entry(buf: &[u8]) -> Result<RaftEntry> {
     bincode::deserialize(buf).map_err(|e| Error::Decode { source: e })
 }
@@ -38,7 +44,11 @@ pub struct RaftEntryStorage {
     inner: Arc<Mutex<RaftEntryStorageInner>>,
 }
 
+
+// 表示用于存储raft日志
 impl RaftEntryStorage {
+
+    // 每个关联一个vnode
     pub fn new(wal: VnodeWal) -> Self {
         Self {
             inner: Arc::new(Mutex::new(RaftEntryStorageInner {
@@ -61,16 +71,20 @@ impl EntryStorage for RaftEntryStorage {
     async fn entry(&self, seq_no: u64) -> ReplicationResult<Option<RaftEntry>> {
         let mut inner = self.inner.lock().await;
 
+        // 通过读取序列号 找到wal文件id
         let (wal_id, pos) = match inner.seq_wal_pos_index.get(&seq_no) {
             Some((wal_id, pos)) => (*wal_id, *pos),
             None => return Ok(None),
         };
+
+        // 读取目标文件 该偏移量的数据
         inner.read(wal_id, pos).await
     }
 
     async fn del_before(&self, seq_no: u64) -> ReplicationResult<()> {
         let mut inner = self.inner.lock().await;
         inner.mark_delete_before(seq_no);
+        // 扫描可以删除的文件
         let wal_ids_can_delete = inner.get_empty_old_wal_ids();
         inner.wal.delete_wal_files(&wal_ids_can_delete).await;
         Ok(())
@@ -78,16 +92,19 @@ impl EntryStorage for RaftEntryStorage {
 
     async fn del_after(&self, seq_no: u64) -> ReplicationResult<()> {
         let mut inner = self.inner.lock().await;
+        // 标记偏移量之后的数据可以删除
         inner.mark_delete_after(seq_no);
         Ok(())
     }
 
+    // 追加一组日志数据
     async fn append(&self, entries: &[RaftEntry]) -> ReplicationResult<()> {
         if entries.is_empty() {
             return Ok(());
         }
         let first_seq_no = entries[0].log_id.index;
         let mut inner = self.inner.lock().await;
+        // 先标记 这样如果序列号冲突应该就会覆盖
         inner.mark_delete_after(first_seq_no);
         for ent in entries {
             let seq = ent.log_id.index;
@@ -99,6 +116,7 @@ impl EntryStorage for RaftEntryStorage {
                 .await
                 .map_err(|e| ReplicationError::RaftInternalErr { msg: e.to_string() })?;
             inner.wal.sync().await.unwrap();
+            // 记录日志序号与文件偏移量的关系
             inner.mark_write_wal(seq, wal_id, pos);
         }
         Ok(())
@@ -106,6 +124,8 @@ impl EntryStorage for RaftEntryStorage {
 
     async fn last_entry(&self) -> ReplicationResult<Option<RaftEntry>> {
         let mut inner = self.inner.lock().await;
+
+        // 读取最后一个日志数据
         if let Some(wal_id_pos) = inner.seq_wal_pos_index.last_entry() {
             let (wal_id, pos) = wal_id_pos.get().to_owned();
             inner.read(wal_id, pos).await
@@ -114,6 +134,7 @@ impl EntryStorage for RaftEntryStorage {
         }
     }
 
+    // 返回范围内的所有日志
     async fn entries(
         &self,
         begin_seq_no: u64,
@@ -140,15 +161,17 @@ impl EntryStorage for RaftEntryStorage {
             return Ok(Vec::new());
         }
 
+        // 读取范围数据
         inner.read_range(min_seq..=max_seq).await
     }
 }
 
 struct RaftEntryStorageInner {
+    /// 具备对一个vnode的数据进行读写的能力 (一个wal目录下所有数据文件)
     wal: VnodeWal,
-    /// Maps seq to (WAL id, position).
+    /// Maps seq to (WAL id, position).     记录每个日志序列号 对应在wal文件的record偏移量
     seq_wal_pos_index: BTreeMap<u64, (u64, u64)>,
-    /// Maps WAL id to it's record count.
+    /// Maps WAL id to it's record count.   标记数据文件的引用次数 避免被提前删除
     wal_ref_count_index: HashMap<u64, u64>,
 }
 
@@ -176,6 +199,7 @@ impl RaftEntryStorageInner {
         range: impl RangeBounds<u64>,
     ) -> ReplicationResult<Vec<RaftEntry>> {
         let mut entries = Vec::new();
+        // 找到所有日志数据
         for (_seq, (wal_id, pos)) in self.seq_wal_pos_index.range(range) {
             if let Some(Block::RaftLog(e)) = self
                 .wal
@@ -191,12 +215,15 @@ impl RaftEntryStorageInner {
     }
 
     fn mark_write_wal(&mut self, seq_no: u64, wal_id: u64, pos: u64) {
+        // 记录对应关系
         self.seq_wal_pos_index.insert(seq_no, (wal_id, pos));
 
+        // 顺便记录引用次数
         let ref_count = self.wal_ref_count_index.entry(wal_id).or_default();
         *ref_count += 1;
     }
 
+    // 这里只是删除seq_wal_pos_index中的记录 不过能否查到日志记录 就依赖该索引
     fn mark_delete_before(&mut self, seq_no: u64) {
         self.seq_wal_pos_index.retain(|&seq, (wal_id, _)| {
             if seq >= seq_no {
@@ -224,6 +251,7 @@ impl RaftEntryStorageInner {
     }
 
     /// Get id list of old WALs that don't needed.
+    /// 找到不再被引用的数据文件
     fn get_empty_old_wal_ids(&self) -> Vec<u64> {
         let current_wal_id = self.wal.current_wal_id();
         let mut wal_ids = Vec::new();
@@ -239,8 +267,11 @@ impl RaftEntryStorageInner {
     }
 
     /// Read WAL files to recover `Self::seq_wal_pos_index`.
+    /// 通过重新加载wal目录下的数据文件 恢复索引结果
     pub async fn recover(&mut self) -> Result<()> {
         let wal_files = file_manager::list_file_names(self.wal.wal_dir());
+
+        // 遍历所有数据文件
         for file_name in wal_files {
             // If file name cannot be parsed to wal id, skip that file.
             let wal_id = match file_utils::get_wal_file_id(&file_name) {
@@ -254,6 +285,7 @@ impl RaftEntryStorageInner {
             let reader = WalReader::open(&path).await?;
             let mut reader = reader.take_record_reader();
             loop {
+                // 不断的读取数据
                 let (pos, seq) = match reader.read_record().await {
                     Ok(r) => {
                         if r.data.len() < 9 {

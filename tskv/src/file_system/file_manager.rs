@@ -35,6 +35,7 @@ pub enum FileError {
 
 static INSTANCE: OnceCell<FileManager> = OnceCell::new();
 
+// 通过该对象来维护所有的wal文件
 pub struct FileManager {
     fs_runtime: Arc<FsRuntime>,
 }
@@ -50,6 +51,7 @@ impl FileManager {
         }
     }
 
+    // 创建文件
     pub async fn open_file_with(
         &self,
         path: impl AsRef<Path>,
@@ -89,11 +91,13 @@ impl FileManager {
     }
 
     /// Open a file to read or write(append mode), if file does not exists then create it.
+    /// 根据路径创建异步文件
     pub async fn open_create_file(&self, path: impl AsRef<Path>) -> Result<AsyncFile> {
         let p = path.as_ref();
         Self::create_dir_if_not_exists(p.parent())?;
         let mut opt = OpenOptions::new();
         opt.read(true).write(true).create(true).append(true);
+        // 传入opt产生文件
         self.open_file_with(path, opt).await
     }
 }

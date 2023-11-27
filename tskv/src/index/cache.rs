@@ -3,15 +3,20 @@ use std::sync::Arc;
 use cache::{ShardedSyncCache, SyncCache};
 use models::{SeriesId, SeriesKey};
 
+// 将一个系列和它的一组标签组合在一起
 #[derive(Debug)]
 pub struct SeriesKeyInfo {
     pub key: SeriesKey,
     pub hash: u64,
     pub id: SeriesId,
 }
+
+// 正向缓存
 #[derive(Debug)]
 pub struct ForwardIndexCache {
+    // 可以先简单看作是一个kv缓存  通过SeriesId检索
     id_map: ShardedSyncCache<SeriesId, Arc<SeriesKeyInfo>>,
+    // 通过hash检索
     hash_map: ShardedSyncCache<u64, Arc<SeriesKeyInfo>>,
 }
 
@@ -23,6 +28,7 @@ impl ForwardIndexCache {
         }
     }
 
+    // 加入缓存
     fn add_series_key_info(&self, info: SeriesKeyInfo) {
         let id = info.id;
         let hash = info.hash;
@@ -42,11 +48,13 @@ impl ForwardIndexCache {
         self.add_series_key_info(info);
     }
 
+    // 删除缓存
     pub fn del(&self, id: SeriesId, hash: u64) {
         self.id_map.remove(&id);
         self.hash_map.remove(&hash);
     }
 
+    // 从缓存获取数据
     pub fn get_series_id_by_key(&self, key: &SeriesKey) -> Option<SeriesId> {
         let hash = key.hash();
 
@@ -59,6 +67,7 @@ impl ForwardIndexCache {
         None
     }
 
+    // id不会发生hash碰撞
     pub fn get_series_key_by_id(&self, id: SeriesId) -> Option<SeriesKey> {
         self.id_map.get(&id).map(|info| info.key.clone())
     }

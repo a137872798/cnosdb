@@ -11,6 +11,7 @@ use crate::Result;
 
 pub type PromRemoteServerRef = Arc<dyn PromRemoteServer + Send + Sync>;
 
+// 普罗米修斯服务 先忽略
 #[async_trait]
 pub trait PromRemoteServer {
     async fn remote_read(

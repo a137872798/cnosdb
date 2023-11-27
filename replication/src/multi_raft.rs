@@ -7,6 +7,7 @@ use parking_lot::RwLock;
 use crate::raft_node::RaftNode;
 use crate::state_store::StateStorage;
 
+// 应该是这个意思 在单个服务上逻辑上只会维护一个group的一个node  这里的multi指的是多个group
 pub struct MultiRaft {
     raft_nodes: HashMap<ReplicationSetId, Arc<RaftNode>>,
 }

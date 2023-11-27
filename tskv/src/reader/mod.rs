@@ -22,6 +22,9 @@ pub trait Cursor: Send + Sync {
     fn is_field(&self) -> bool {
         matches!(self.column_type(), PhysicalCType::Field(_))
     }
+    // 描述此时读取的数据列类型  分为 Tag/Time/Field    cnosdb中的列分为3类  第一类是数据列 field 第二类是标签列 tab 第三列是时间序列 time
     fn column_type(&self) -> PhysicalCType;
+
+    // 遍历每次得到一个列值
     async fn next(&mut self) -> Result<Option<DataType>, Error>;
 }

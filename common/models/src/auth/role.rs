@@ -43,6 +43,7 @@ impl<T: Id> UserRole<T> {
     }
 }
 
+// 获取某用户的所有角色
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TenantRoleIdentifier {
     System(SystemTenantRole),
@@ -88,6 +89,7 @@ where
     }
 }
 
+// 代表这个角色是租户的所有者 还是成员
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SystemTenantRole {
     Owner,
@@ -143,13 +145,16 @@ impl SystemTenantRole {
 
 pub type CustomTenantRoleRef<T> = Arc<RwLock<CustomTenantRole<T>>>;
 
+// 代表一个自定义角色
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomTenantRole<T> {
     id: T,
     name: String,
+    // 代表这个角色是普通用户 or 管理员
     system_role: SystemTenantRole,
     // database_name -> privileges
     // only add database privilege
+    // 该角色所拥有的权限
     additional_privileges: HashMap<String, DatabasePrivilege>,
 }
 

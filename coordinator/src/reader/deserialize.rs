@@ -24,8 +24,10 @@ impl Stream for TonicRecordBatchDecoder {
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match ready!(self.stream.poll_next_unpin(cx)) {
+            // 通过grpc拉取到的数据流 可以通过arrow-ipc进行反序列化 得到 RecordBatch
             Some(Ok(received)) => match record_batch_decode(&received.data) {
                 Ok(batch) => Poll::Ready(Some(Ok(batch))),
+                // 这个是arrow的解析失败
                 Err(err) => Poll::Ready(Some(Err(err.into()))),
             },
             Some(Err(err)) => Poll::Ready(Some(Err(CoordinatorError::TskvError {

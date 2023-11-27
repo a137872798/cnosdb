@@ -15,24 +15,33 @@ use crate::wal::reader::WalReader;
 use crate::wal::{raft_store, reader, WalType, WAL_FOOTER_MAGIC_NUMBER};
 use crate::{record_file, Error, Result};
 
+// cnosdb 应该是有自己的文件格式的 这里是生成文件脚
 fn build_footer(min_sequence: u64, max_sequence: u64) -> [u8; record_file::FILE_FOOTER_LEN] {
     let mut footer = [0_u8; record_file::FILE_FOOTER_LEN];
+    // wal文件 之后记录该文件中数据最小序列和最大序列
     footer[0..4].copy_from_slice(&WAL_FOOTER_MAGIC_NUMBER.to_be_bytes());
     footer[16..24].copy_from_slice(&min_sequence.to_be_bytes());
     footer[24..32].copy_from_slice(&max_sequence.to_be_bytes());
     footer
 }
 
+// 该对象用于往wal文件中写入数据
 pub struct WalWriter {
     id: u64,
+    // 通过该对象与底层文件交互
     inner: record_file::Writer,
+    // 目前文件的总长度
     size: u64,
+    // writer写入的文件路径
     path: PathBuf,
+    // 写入时的选项
     config: Arc<WalOptions>,
-
+    // 写入的缓冲区
     buf: Vec<u8>,
+    // 对应文件的最小序列和最大序列  序列号对应的是一个record
     min_sequence: u64,
     max_sequence: u64,
+    // 是否需要写入footer
     has_footer: bool,
 }
 
@@ -43,19 +52,25 @@ impl WalWriter {
         config: Arc<WalOptions>,
         id: u64,
         path: impl AsRef<Path>,
-        min_seq: u64,
+        min_seq: u64,  // 在开启前就已经知道首条数据的序列了
     ) -> Result<Self> {
         let path = path.as_ref();
 
         // Use min_sequence existing in file, otherwise in parameter
+        // 先检查路径文件是否已经存在
         let (writer, min_sequence, max_sequence) = if file_manager::try_exists(path) {
             let writer = record_file::Writer::open(path, RecordDataType::Wal).await?;
+
+            // 先前已经存在的文件  读取footer信息
             let (min_sequence, max_sequence) = match writer.footer() {
                 Some(footer) => reader::parse_footer(footer).unwrap_or((min_seq, min_seq)),
+                // 未找到则使用 min_seq
                 None => (min_seq, min_seq),
             };
             (writer, min_sequence, max_sequence)
         } else {
+
+            // 创建新文件
             (
                 record_file::Writer::open(path, RecordDataType::Wal).await?,
                 min_seq,
@@ -71,6 +86,7 @@ impl WalWriter {
             size,
             path: PathBuf::from(path),
             config,
+            // 缓冲区
             buf: Vec::new(),
             min_sequence,
             max_sequence,
@@ -79,18 +95,20 @@ impl WalWriter {
     }
 
     /// Writes data, returns data sequence and data size.
+    /// 写入数据
     pub async fn write(
         &mut self,
         tenant: &str,
-        vnode_id: VnodeId,
+        vnode_id: VnodeId,  // 描述本次数据对应的分片
         precision: Precision,
-        points: &[u8],
+        points: &[u8],  // 数据以二进制形式传输
     ) -> Result<(u64, usize)> {
         let seq = self.max_sequence;
         let tenant_len = tenant.len() as u64;
 
         let written_size = self
             .inner
+            // 直接写入底层文件了
             .write_record(
                 RecordDataVersion::V1 as u8,
                 RecordDataType::Wal as u8,
@@ -116,6 +134,8 @@ impl WalWriter {
         Ok((seq, written_size))
     }
 
+    // 删除某个vnode相关的数据  wal 也就是删除也是append的形式  之后在compact中进行合并
+    // 因为没有多余的索引 连续读取会很快
     pub async fn delete_vnode(
         &mut self,
         tenant: &str,
@@ -151,6 +171,7 @@ impl WalWriter {
         Ok((seq, written_size))
     }
 
+    // 这些操作都变成了wal记录
     pub async fn delete_table(
         &mut self,
         tenant: &str,
@@ -188,6 +209,7 @@ impl WalWriter {
         Ok((seq, written_size))
     }
 
+    // 更新一系列的key
     pub async fn update_series_keys(
         &mut self,
         tenant: &str,
@@ -218,7 +240,7 @@ impl WalWriter {
                 [
                     &[WalType::UpdateSeriesKeys as u8][..],
                     &seq.to_be_bytes(),
-                    &block_buf,
+                    &block_buf,  // 将编码后的数据写入
                 ]
                 .as_slice(),
             )
@@ -232,6 +254,8 @@ impl WalWriter {
         self.size += written_size as u64;
         Ok((seq, written_size))
     }
+
+    // 下面的套路都是一致的
 
     pub async fn delete(
         &mut self,
@@ -273,9 +297,10 @@ impl WalWriter {
         Ok((seq, written_size))
     }
 
+    //
     pub async fn append_raft_entry(
         &mut self,
-        raft_entry: &raft_store::RaftEntry,
+        raft_entry: &raft_store::RaftEntry,  // 对应raft的一条日志
     ) -> Result<(u64, usize)> {
         let wal_type = match raft_entry.payload {
             openraft::EntryPayload::Blank => WalType::RaftNormalLog,
@@ -284,9 +309,11 @@ impl WalWriter {
         };
 
         let seq = raft_entry.log_id.index;
+        // 将日志数据序列化
         let raft_entry_bytes =
             bincode::serialize(raft_entry).map_err(|e| Error::Encode { source: e })?;
 
+        // 写入raft日志  不是有日志存储模块吗?
         let written_size = self
             .inner
             .write_record(
@@ -322,6 +349,7 @@ impl WalWriter {
         Ok(size)
     }
 
+    // 包装内部文件 生成reader
     pub fn new_reader(&self) -> WalReader {
         let record_reader = self.inner.new_reader();
         WalReader::new(
@@ -355,6 +383,7 @@ impl WalWriter {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 
+// 代表一个写入任务
 pub enum Task {
     Write(WriteTask),
     DeleteVnode(DeleteVnodeTask),
@@ -364,6 +393,8 @@ pub enum Task {
 }
 
 impl Task {
+
+    // 创建一个新的写入任务
     pub fn new_write(
         tenant: String,
         database: String,
@@ -432,6 +463,7 @@ impl Task {
         })
     }
 
+    // 根据任务信息 生成db名
     pub fn tenant_database(&self) -> String {
         match self {
             Self::Write(WriteTask {
@@ -467,6 +499,7 @@ impl Task {
 impl TryFrom<&reader::Block> for Task {
     type Error = crate::Error;
 
+    // 将读取到的数据块 有转换成一个写入任务
     fn try_from(b: &reader::Block) -> std::result::Result<Self, Self::Error> {
         match b {
             reader::Block::Write(blk) => {
@@ -482,13 +515,14 @@ impl TryFrom<&reader::Block> for Task {
     }
 }
 
+// 一个写入任务
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WriteTask {
     pub tenant: String,
     pub database: String,
-    pub vnode_id: VnodeId,
-    pub precision: Precision,
-    pub points: Vec<u8>,
+    pub vnode_id: VnodeId,  // 前3个参数用于定位写入的位置
+    pub precision: Precision,  // 有关时间的精度
+    pub points: Vec<u8>,  // 要写入的数据
 }
 
 impl TryFrom<&reader::WriteBlock> for WriteTask {

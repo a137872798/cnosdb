@@ -28,7 +28,9 @@ pub struct ExpectedRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalBucketRequest {
+    // 限流的类型
     pub kind: RequestLimiterKind,
+    // 期望请求的permit数量
     pub expected: ExpectedRequest,
 }
 
@@ -40,12 +42,14 @@ pub struct LocalBucketResponse {
     pub remote_remain: i64,
 }
 
+
+// 本地限流器 限流器分为2级 先走本地限流
 #[derive(Debug)]
 pub struct LocalRequestLimiter {
     cluster: String,
     tenant: String,
-    meta_http_client: MetaHttpClient,
-    buckets: RwLock<HashMap<RequestLimiterKind, Arc<Mutex<CountBucket>>>>,
+    meta_http_client: MetaHttpClient,  // 通过该对象访问元数据服务器
+    buckets: RwLock<HashMap<RequestLimiterKind, Arc<Mutex<CountBucket>>>>,  // 这个是简单的计数限流器
 }
 
 impl LocalRequestLimiter {
@@ -63,6 +67,7 @@ impl LocalRequestLimiter {
         }
     }
 
+    // 根据限流配置初始化本地限流器
     fn load_config(
         limiter_config: Option<&RequestLimiterConfig>,
     ) -> HashMap<RequestLimiterKind, Arc<Mutex<CountBucket>>> {
@@ -84,6 +89,7 @@ impl LocalRequestLimiter {
         }
     }
 
+    // 尝试获取permit  因为在并发环境 使用mutex
     fn require(&self, bucket_guard: &mut MutexGuard<CountBucket>, require: i64) -> RequireResult {
         if require < 0 {
             return RequireResult::Fail;
@@ -108,8 +114,10 @@ impl LocalRequestLimiter {
             }
         };
 
+        // 本地被限流时 可以尝试去集群限流器获取permit
         if now_count <= 0 && require <= max {
             RequireResult::RequestMeta {
+                // 期望借用后 本地维持在 (max-require)～max的范围
                 min: now_count.abs() + require,
                 max: now_count.abs() + max,
             }
@@ -121,21 +129,22 @@ impl LocalRequestLimiter {
         }
     }
 
+    // 请求远端的限流器
     async fn remote_requre(
         &self,
         kind: RequestLimiterKind,
         bucket_guard: &mut MutexGuard<'_, CountBucket>,
-        data_len: i64,
-        min: i64,
-        max: i64,
+        data_len: i64,  // 本次真正要请求的permit
+        min: i64,  // 期望拉取的最少permit
+        max: i64,  // 期望拉取的最大permit
     ) -> MetaResult<()> {
         let request = LocalBucketRequest {
             kind,
             expected: ExpectedRequest { min, max },
         };
         let LocalBucketResponse {
-            alloc,
-            remote_remain,
+            alloc,  // 代表实际分配的permit
+            remote_remain,  // 远端还剩余多少
             ..
         } = self
             .meta_http_client
@@ -159,10 +168,12 @@ impl LocalRequestLimiter {
         }
     }
 
+    // 根据请求类型返回对应的bucket
     async fn get_buket(&self, kind: RequestLimiterKind) -> Option<Arc<Mutex<CountBucket>>> {
         self.buckets.read().await.get(&kind).cloned()
     }
 
+    // 从某个类型获取permit
     async fn check_bucket(&self, kind: RequestLimiterKind, data_len: usize) -> MetaResult<()> {
         let bucket = match self.get_buket(kind).await {
             Some(bucket) => bucket,
@@ -172,6 +183,7 @@ impl LocalRequestLimiter {
 
         let data_len = data_len as i64;
 
+        // 先尝试本地获取
         match self.require(&mut bucket_guard, data_len) {
             RequireResult::Success => {
                 debug!(
@@ -184,6 +196,7 @@ impl LocalRequestLimiter {
                 Ok(())
             }
 
+            // 从远端获取
             RequireResult::RequestMeta { min, max } => {
                 self.remote_requre(kind, &mut bucket_guard, data_len, min, max)
                     .await
@@ -196,6 +209,7 @@ impl LocalRequestLimiter {
         self.buckets.write().await.clear()
     }
 
+    // 更新某个限流器的本地配置
     pub async fn change(&self, limiter_config: Option<&RequestLimiterConfig>) -> MetaResult<()> {
         let mut buckets_guard = self.buckets.write().await;
         *buckets_guard = Self::load_config(limiter_config);

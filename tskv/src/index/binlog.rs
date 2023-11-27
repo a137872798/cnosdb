@@ -17,6 +17,7 @@ pub const SEGMENT_FILE_MAGIC: [u8; 4] = [0x48, 0x49, 0x4e, 0x02];
 pub const SEGMENT_FILE_MAX_SIZE: u64 = 64 * 1024 * 1024;
 pub const BLOCK_HEADER_SIZE: usize = 4;
 
+// 记录一些有关系列的操作日志
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub enum IndexBinlogBlock {
     Add(Vec<AddSeries>),
@@ -24,10 +25,13 @@ pub enum IndexBinlogBlock {
     Update(UpdateSeriesKey),
 }
 
+// 添加了一个系列
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct AddSeries {
     ts: i64,
+    // 系列的id
     series_id: SeriesId,
+    // 系列的描述信息 包括一组kv 和table_name
     data: SeriesKey,
 }
 
@@ -53,6 +57,7 @@ impl AddSeries {
     }
 }
 
+// 代表删除一个系列
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct DeleteSeries {
     series_id: SeriesId,
@@ -68,15 +73,18 @@ impl DeleteSeries {
     }
 }
 
+// 更新 SeriesKey信息
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 pub struct UpdateSeriesKey {
     // delete keys
     // insert: (keys, ids) + (tag, ids) + (ids + keys)
     old_series: SeriesKey,
     new_series: SeriesKey,
+    // 通过id定位到系列
     series_id: SeriesId,
     // 如果是恢复wal执行的update操作(recovering = true)，需要标记为已删除的series key删掉
     // 如果是正常运行过程中的update操作(recovering = false)，需要将待修改的series key加删除标记
+    // 也就是根据当前阶段进行不同处理 恢复阶段相当于是merge 运行阶段只会记录删除日志
     recovering: bool,
 }
 
@@ -120,6 +128,7 @@ impl IndexBinlogBlock {
         Ok(size)
     }
 
+    // 编码后并通过writer进行写入
     pub fn encode<W>(&self, writer: W) -> Result<(), IndexError>
     where
         W: std::io::Write,
@@ -142,9 +151,11 @@ pub struct IndexBinlog {
     writer_file: BinlogWriter,
 }
 
+// 通过该对象写入和读取 binlogBlock
 impl IndexBinlog {
     pub async fn new(path: impl AsRef<Path>) -> IndexResult<Self> {
         let data_dir = path.as_ref();
+        // 从文件上解析出文件序列 这个序列作为文件id
         let (last, seq) = match file_utils::get_max_sequence_file_name(
             data_dir,
             file_utils::get_index_binlog_file_id,
@@ -168,6 +179,7 @@ impl IndexBinlog {
         })
     }
 
+    // 判断是否要产生新文件 跟record_file一样
     async fn roll_write_file(&mut self) -> IndexResult<()> {
         if self.writer_file.size > SEGMENT_FILE_MAX_SIZE {
             debug!(
@@ -178,6 +190,7 @@ impl IndexBinlog {
             let new_file_id = self.writer_file.id + 1;
             let new_file_name = file_utils::make_index_binlog_file(&self.path, new_file_id);
             let new_file = BinlogWriter::open(new_file_id, new_file_name).await?;
+            // replace 交换2个对象的所有权
             let mut old_file = std::mem::replace(&mut self.writer_file, new_file);
             old_file.flush().await?;
 
@@ -186,6 +199,7 @@ impl IndexBinlog {
         Ok(())
     }
 
+    // 写入binlogBlock
     pub async fn write_blocks(&mut self, blocks: &[IndexBinlogBlock]) -> IndexResult<()> {
         self.roll_write_file().await?;
 
@@ -210,10 +224,12 @@ impl IndexBinlog {
         Ok(())
     }
 
+    // 当前正在写入的文件id
     pub fn current_write_file_id(&self) -> u64 {
         self.writer_file.id
     }
 
+    // 将该文件偏移量写入到header
     pub async fn advance_write_offset(&mut self, offset: u32) -> IndexResult<()> {
         self.writer_file.advance_write_offset(offset).await
     }
@@ -223,10 +239,10 @@ impl IndexBinlog {
     }
 }
 
+// binlog
 pub struct BinlogWriter {
     id: u64,
     size: u64,
-
     pub file: AsyncFile,
 }
 
@@ -237,6 +253,7 @@ impl BinlogWriter {
             .map_err(|e| IndexError::FileErrors { msg: e.to_string() })?;
 
         let mut size = file.len();
+        // 简单理解就是空文件  先写入头部
         if size < SEGMENT_FILE_HEADER_SIZE as u64 {
             size = SEGMENT_FILE_HEADER_SIZE as u64;
             BinlogWriter::write_header(&file, SEGMENT_FILE_HEADER_SIZE as u32).await?;
@@ -256,7 +273,9 @@ impl BinlogWriter {
         Ok(())
     }
 
+    // 更新偏移量的值
     pub async fn advance_write_offset(&mut self, mut offset: u32) -> IndexResult<()> {
+        // 未指定的清空下 使用size
         if offset == 0 {
             offset = self.size as u32;
         }
@@ -264,7 +283,9 @@ impl BinlogWriter {
         BinlogWriter::write_header(&self.file, offset).await
     }
 
+    // 写入字节数组
     pub async fn write(&mut self, data: &[u8]) -> IndexResult<usize> {
+        // 从末尾追加写入
         let mut pos = self.size;
         pos += self.file.write_at(pos, data).await? as u64;
 
@@ -286,11 +307,13 @@ impl BinlogWriter {
         );
 
         let written_size = (pos - self.size) as usize;
+        // 更新size
         self.size = pos;
 
         Ok(written_size)
     }
 
+    // 文件刷盘
     pub async fn flush(&mut self) -> IndexResult<()> {
         // Do fsync
         self.file.sync_data().await?;
@@ -299,17 +322,20 @@ impl BinlogWriter {
     }
 }
 
+// 用于读取binlog文件
 pub struct BinlogReader {
     id: u64,
+    // 通过该对象作为媒介来读取
     cursor: FileCursor,
-
     body_buf: Vec<u8>,
     header_buf: [u8; BLOCK_HEADER_SIZE],
 }
 
 impl BinlogReader {
     pub async fn new(id: u64, mut cursor: FileCursor) -> IndexResult<Self> {
+        // 调用底层 read api 拿到数据
         let header_buf = BinlogReader::reade_header(&mut cursor).await?;
+        // 解出偏移量 并设置
         let offset = byte_utils::decode_be_u32(&header_buf[4..8]);
 
         debug!("Read index binlog begin read offset: {}", offset);
@@ -333,6 +359,7 @@ impl BinlogReader {
         Ok(header_buf)
     }
 
+    // 是否已经读取到末尾了
     pub fn read_over(&mut self) -> bool {
         self.cursor.pos() >= self.cursor.len()
     }
@@ -346,6 +373,7 @@ impl BinlogReader {
         Ok(())
     }
 
+    // 将偏移量记录到header
     pub async fn advance_read_offset(&mut self, mut offset: u32) -> IndexResult<()> {
         if offset == 0 {
             offset = self.cursor.pos() as u32;
@@ -354,6 +382,7 @@ impl BinlogReader {
         BinlogWriter::write_header(self.cursor.file_ref(), offset).await
     }
 
+    // 返回此时的游标 和返回文件总长度
     pub fn read_pos(&self) -> u64 {
         self.cursor.pos()
     }
@@ -362,13 +391,16 @@ impl BinlogReader {
         self.cursor.len()
     }
 
+    // 每次读取一个 binlog数据   而这些binlog记录的是有关series的变化  add/delete/update
     pub async fn next_block(&mut self) -> IndexResult<Option<IndexBinlogBlock>> {
+        // 已经读取到末尾了 返回None
         if self.read_over() {
             return Ok(None);
         }
 
         debug!("Read index binlog: cursor.pos={}", self.cursor.pos());
 
+        // 每块数据有一个header  就跟record一样
         let read_bytes = self.cursor.read(&mut self.header_buf[..]).await?;
         if read_bytes < BLOCK_HEADER_SIZE {
             return Err(IndexError::FileErrors {
@@ -376,10 +408,12 @@ impl BinlogReader {
             });
         }
 
+        // 解开得到binlog长度信息
         let data_len = byte_utils::decode_be_u32(self.header_buf[0..BLOCK_HEADER_SIZE].into());
 
         debug!("Read Binlog Reader: data_len={}", data_len);
 
+        // 文件不完整
         if data_len > (self.file_len() - self.read_pos()) as u32 {
             error!(
                 "binlog read block error {}, {} {} ",
@@ -398,6 +432,7 @@ impl BinlogReader {
             });
         }
 
+        // 根据需要对body_buf进行扩容
         if data_len as usize > self.body_buf.len() {
             self.body_buf.resize(data_len as usize, 0);
         }
@@ -410,6 +445,7 @@ impl BinlogReader {
             });
         }
 
+        // 将buf数据转换成 binlogBlock
         let block = IndexBinlogBlock::decode(buf)?;
 
         Ok(Some(block))
@@ -417,12 +453,16 @@ impl BinlogReader {
 }
 
 pub async fn repair_index_file(file_name: &str) -> IndexResult<()> {
+    // 根据指定的文件 产生writer/reader
     let tmp_file = BinlogWriter::open(0, PathBuf::from(file_name)).await?;
     let mut reader_file = BinlogReader::new(0, tmp_file.file.into()).await?;
 
     let file_read_offset = reader_file.read_pos();
+
+    // 检查是否需要修复文件
     let mut max_can_repair = 0;
 
+    // 不断读取数据 并更新游标
     while let Ok(Some(_)) = reader_file.next_block().await {
         max_can_repair = reader_file.read_pos();
     }
@@ -434,14 +474,17 @@ pub async fn repair_index_file(file_name: &str) -> IndexResult<()> {
         max_can_repair
     );
 
+    // 代表不需要修复文件
     if file_read_offset >= max_can_repair {
         println!("don't need generate repaire file");
         return Ok(());
     }
 
+    // 重新打开文件 将所有数据读取到buffer
     let mut buffer = Vec::new();
     std::fs::File::open(file_name)?.read_to_end(&mut buffer)?;
 
+    // 将数据写到一个 repair文件中
     let mut file = std::fs::File::create(format!("{}.repair", file_name))?;
 
     file.write_all(&buffer)?;

@@ -14,6 +14,7 @@ where
     K: Debug + Hash + Send + Sync,
     V: Debug + Clone + Send + Sync,
 {
+    // 二级缓存 内部的SyncCache 本身就是一个kv缓存
     shard: Vec<Box<dyn SyncCache<K = K, V = V>>>,
 }
 unsafe impl<K: Debug + Send + Hash + Sync, V: Debug + Send + Sync + Clone> Send

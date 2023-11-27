@@ -29,6 +29,8 @@ impl DBschemas {
                 .ok_or(SchemaError::TenantNotFound {
                     tenant: db_schema.tenant_name().to_string(),
                 })?;
+
+        // 如果元数据中 还没有该db的数据 会触发创建操作
         if client
             .get_db_schema_for_special_case(db_schema.database_name())?
             .is_none()
@@ -53,6 +55,7 @@ impl DBschemas {
         field_names: &[&str],
         field_type: &[FieldType],
     ) -> Result<()> {
+        // 从本地加载当前表的schema
         let schema = self
             .client
             .get_tskv_table_schema(&self.database_name, table_name)?
@@ -61,6 +64,7 @@ impl DBschemas {
                 table: table_name.to_string(),
             })?;
 
+        // 检查与schema是否匹配
         for (field_name, field_type) in field_names.iter().zip(field_type) {
             if let Some(v) = schema.column(field_name) {
                 if field_type.0 != v.column_type.field_type() as i32 {
@@ -82,6 +86,7 @@ impl DBschemas {
             }
         }
 
+        // 检查tag是否匹配
         for tag_name in tag_names {
             if let Some(v) = schema.column(tag_name) {
                 if ColumnType::Tag != v.column_type {
@@ -101,6 +106,7 @@ impl DBschemas {
         Ok(())
     }
 
+    // 调用build_write_group_loose_mode时 会触发该方法
     pub async fn check_field_type_or_else_add(
         &self,
         db_name: &str,
@@ -110,7 +116,10 @@ impl DBschemas {
         field_type: &[FieldType],
     ) -> Result<bool> {
         //load schema first from cache,or else from storage and than cache it!
+        // 尝试获取table级别的schema
         let schema = self.client.get_tskv_table_schema(db_name, table_name)?;
+
+        // 这个是db级别的schema
         let db_schema =
             self.client
                 .get_db_schema(db_name)?
@@ -119,8 +128,10 @@ impl DBschemas {
                 })?;
         let precision = db_schema.config.precision_or_default();
         let mut new_schema = false;
+
         let mut schema = match schema {
             None => {
+                // 此时还没有table级别的schema 要创建
                 let mut schema = TskvTableSchema::default();
                 schema.tenant = self.tenant_name.clone();
                 schema.db = db_name.to_string();
@@ -131,6 +142,7 @@ impl DBschemas {
             Some(schema) => schema.as_ref().clone(),
         };
 
+        // 判断是否要变更schema
         let mut schema_change = false;
         let mut check_fn = |field: &mut TableColumn| -> Result<()> {
             let encoding = match schema.column(&field.name) {
@@ -140,6 +152,7 @@ impl DBschemas {
             field.encoding = encoding;
 
             match schema.column(&field.name) {
+                // 对比发生冲突 还是发现是新列
                 Some(v) => {
                     let meta_dt = v.column_type.to_physical_type();
                     let kv_dt = field.column_type.to_physical_type();
@@ -187,12 +200,15 @@ impl DBschemas {
 
         //schema changed store it
         if new_schema {
+            // 发送创建table的请求到 元数据服务
             schema.schema_id = 0;
             let schema: TskvTableSchemaRef = schema.into();
             let res = self
                 .client
                 .create_table(&TableSchema::TsKvTableSchema(schema.clone()))
                 .await;
+
+            // 处理结果
             self.check_create_table_res(res, schema).await?;
         } else if schema_change {
             schema.schema_id += 1;

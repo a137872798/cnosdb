@@ -36,6 +36,7 @@ impl From<&Config> for Options {
     }
 }
 
+// 一些存储选项
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct StorageOptions {
     pub path: PathBuf,
@@ -44,9 +45,9 @@ pub struct StorageOptions {
     pub flush_req_channel_cap: usize,
     pub max_cached_readers: usize,
     pub max_level: u16,
-    pub compact_trigger_file_num: u32,
+    pub compact_trigger_file_num: u32,  // level1级别的数据文件 待合并数量至少要超过这个值 才有合并的价值
     pub compact_trigger_cold_duration: Duration,
-    pub max_compact_size: u64,
+    pub max_compact_size: u64,  // 单次合并的文件数量上限是可控的
     pub max_concurrent_compaction: u16,
     pub strict_write: bool,
 }
@@ -178,14 +179,22 @@ impl From<&Config> for QueryOptions {
     }
 }
 
+// WalWriter
 #[derive(Debug, Clone)]
 pub struct WalOptions {
+
+    // 能否写入
     pub enabled: bool,
     pub path: PathBuf,
+    // 应该是写请求的缓冲通道
     pub wal_req_channel_cap: usize,
+    // 当wal文件大小达到多少时 会切换文件
     pub max_file_size: u64,
+    // 当文件大小达到多少时 触发一次flush
     pub flush_trigger_total_file_size: u64,
+    // 每次写入都要sync
     pub sync: bool,
+    // 每隔多久触发一次sync
     pub sync_interval: Duration,
 }
 

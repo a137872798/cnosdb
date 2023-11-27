@@ -7,6 +7,8 @@ pub struct CountBucketBuilder {
     max_count: Option<i64>,
 }
 
+// 简单的限流桶 未超过count就可以
+
 impl CountBucketBuilder {
     pub fn initial(&mut self, initial: i64) {
         self.count = initial;

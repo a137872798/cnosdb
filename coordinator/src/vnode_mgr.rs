@@ -263,11 +263,14 @@ impl VnodeManager {
         Ok(resp)
     }
 
+    // 从目标服务器下载指定文件
     pub async fn download_file(
         download: &str,
         filename: &Path,
         client: &mut TskvServiceClient<Timeout<Channel>>,
     ) -> CoordinatorResult<()> {
+
+        // 先在本地创建目录
         if let Some(dir) = filename.parent() {
             tokio::fs::create_dir_all(dir).await?;
         }
@@ -283,11 +286,14 @@ impl VnodeManager {
         let request = tonic::Request::new(DownloadFileRequest {
             filename: download.to_string(),
         });
+
         let mut resp_stream = client
             .download_file(request)
             .await
             .map_err(tskv::Error::from)?
             .into_inner();
+
+        // 得到字节流  并不断拉取
         while let Some(received) = resp_stream.next().await {
             let received = received?;
             if received.code != SUCCESS_RESPONSE_CODE {
@@ -300,6 +306,7 @@ impl VnodeManager {
                 });
             }
 
+            // 将每次拉取到的数据流写入文件
             file.write_all(&received.data).await?;
         }
 

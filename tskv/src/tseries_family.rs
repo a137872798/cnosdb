@@ -31,15 +31,24 @@ use crate::tsm::TsmReader;
 use crate::Error::CommonError;
 use crate::{ColumnFileId, LevelId, Options, TseriesFamilyId};
 
+
+// 代表存储某个列数据的文件
 #[derive(Debug)]
 pub struct ColumnFile {
+    // 代表某个列文件的id
     file_id: ColumnFileId,
+    // 表示级别
     level: LevelId,
+    // 是否是增量数据   目前看到level0 是增量数据
     is_delta: bool,
+    // 表示一个时间范围
     time_range: TimeRange,
     size: u64,
+    // 该对象用于存储fieldId
     field_id_filter: Arc<BloomFilter>,
+    // 表示该数据文件已经被标记成删除了
     deleted: AtomicBool,
+    // 正在数据合并中
     compacting: AtomicBool,
 
     path: PathBuf,
@@ -48,9 +57,9 @@ pub struct ColumnFile {
 
 impl ColumnFile {
     pub fn with_compact_data(
-        meta: &CompactMeta,
+        meta: &CompactMeta,     // 在数据合并后 会产生一个该对象 描述合并后的文件
         path: impl AsRef<Path>,
-        field_id_filter: Arc<BloomFilter>,
+        field_id_filter: Arc<BloomFilter>,  // 存储该数据文件中的field_id
         tsm_reader_cache: Weak<ShardedAsyncCache<String, Arc<TsmReader>>>,
     ) -> Self {
         Self {
@@ -60,6 +69,7 @@ impl ColumnFile {
             time_range: TimeRange::new(meta.min_ts, meta.max_ts),
             size: meta.file_size,
             field_id_filter,
+            // 刚创建 未被删除也未被合并
             deleted: AtomicBool::new(false),
             compacting: AtomicBool::new(false),
             path: path.as_ref().into(),
@@ -95,10 +105,13 @@ impl ColumnFile {
         self.time_range.overlaps(time_range)
     }
 
+
+    // 通过布隆过滤器 快速判断是否包含某个字段
     pub fn contains_field_id(&self, field_id: FieldId) -> bool {
         self.field_id_filter.contains(&field_id.to_be_bytes())
     }
 
+    // 是否存在任一field
     pub fn contains_any_field_id(&self, field_ids: &[FieldId]) -> bool {
         for field_id in field_ids {
             if self.field_id_filter.contains(&field_id.to_be_bytes()) {
@@ -136,6 +149,8 @@ impl ColumnFile {
 impl Drop for ColumnFile {
     fn drop(&mut self) {
         debug!("Removing file {}", self.file_id);
+
+        // 当发现文件被标记成删除时  自动触发文件删除操作
         if self.is_deleted() {
             let path = self.file_path();
             if let Some(cache) = self.tsm_reader_cache.upgrade() {
@@ -188,11 +203,12 @@ impl ColumnFile {
     }
 }
 
+// 级别信息   这个级别应该是描述时间颗粒度的 不同颗粒度检索涉及的数据量不同
 #[derive(Debug)]
 pub struct LevelInfo {
     /// the time_range of column file is overlap in L0,
     /// the time_range of column file is not overlap in L0,
-    pub files: Vec<Arc<ColumnFile>>,
+    pub files: Vec<Arc<ColumnFile>>,  // 一组文件信息  其中某些文件可能正在合并中
     pub database: Arc<String>,
     pub tsf_id: u32,
     pub storage_opt: Arc<StorageOptions>,
@@ -239,12 +255,14 @@ impl LevelInfo {
         ]
     }
 
+    // 将一个描述合并后的数据文件元数据 追加到levelInfo中
     pub fn push_compact_meta(
         &mut self,
         compact_meta: &CompactMeta,
         field_filter: Arc<BloomFilter>,
         tsm_reader_cache: Weak<ShardedAsyncCache<String, Arc<TsmReader>>>,
     ) {
+        // 生成对应的目录
         let file_path = if compact_meta.is_delta {
             let base_dir = self.storage_opt.delta_dir(&self.database, self.tsf_id);
             make_delta_file(base_dir, compact_meta.file_id)
@@ -252,6 +270,8 @@ impl LevelInfo {
             let base_dir = self.storage_opt.tsm_dir(&self.database, self.tsf_id);
             make_tsm_file(base_dir, compact_meta.file_id)
         };
+
+        // 使用level_info 来维护新文件
         self.files.push(Arc::new(ColumnFile::with_compact_data(
             compact_meta,
             file_path,
@@ -260,12 +280,15 @@ impl LevelInfo {
         )));
         self.tsf_id = compact_meta.tsf_id;
         self.cur_size += compact_meta.file_size;
+        // 尝试更新时间范围
         self.time_range.max_ts = self.time_range.max_ts.max(compact_meta.max_ts);
         self.time_range.min_ts = self.time_range.min_ts.min(compact_meta.min_ts);
 
+        // 对文件排序
         self.sort_file_asc();
     }
 
+    // 直接追加 columnFile
     pub fn push_column_file(&mut self, file: Arc<ColumnFile>) {
         self.cur_size += file.size;
         self.time_range.max_ts = self.time_range.max_ts.max(file.time_range.max_ts);
@@ -277,6 +300,7 @@ impl LevelInfo {
 
     /// Update time_range by a scan with files.
     /// If files is empty, time_range will be (i64::MAX, i64::MIN).
+    /// 根据现有files 尝试更新时间范围
     pub(crate) fn update_time_range(&mut self) {
         let mut min_ts = Timestamp::MAX;
         let mut max_ts = Timestamp::MIN;
@@ -327,14 +351,17 @@ impl LevelInfo {
             .sort_by(|a, b| a.file_id.partial_cmp(&b.file_id).unwrap());
     }
 
+    // 计算磁盘存储消耗
     pub fn disk_storage(&self) -> u64 {
         self.files.iter().map(|f| f.size).sum()
     }
 
+    // 当前level_info 对应的level级别
     pub fn level(&self) -> u32 {
         self.level
     }
 
+    // 返回与range有时间交集的文件  且饱含该field
     pub fn overlaps_column_files(
         &self,
         time_ranges: &TimeRanges,
@@ -353,14 +380,20 @@ impl LevelInfo {
 
 #[derive(Debug)]
 pub struct Version {
+    // 一个系列对应一个 vnode
     ts_family_id: TseriesFamilyId,
+    // 租户+数据库名
     tenant_database: Arc<String>,
     storage_opt: Arc<StorageOptions>,
     /// The max seq_no of write batch in wal flushed to column file.
+    /// 写入数据的最大序列号
     last_seq: u64,
     /// The max timestamp of write batch in wal flushed to column file.
+    /// 表示之前已刷盘的数据文件的最大时间戳 之后的刷盘会以这个时间戳作为分界线 划分level
     max_level_ts: i64,
+    /// 有5个级别信息   每个级别对应不同的时间粒度
     levels_info: [LevelInfo; 5],
+    /// 缓存reader对象  key是数据文件的目录
     tsm_reader_cache: Arc<ShardedAsyncCache<String, Arc<TsmReader>>>,
 }
 
@@ -387,14 +420,19 @@ impl Version {
     }
 
     /// Creates new Version using current Version and `VersionEdit`s.
+    /// 基于当前版本和edit对象 产生一个新的版本
     pub fn copy_apply_version_edits(
         &self,
         version_edits: Vec<VersionEdit>,
         file_metas: &mut HashMap<ColumnFileId, Arc<BloomFilter>>,
         last_seq: Option<u64>,
     ) -> Version {
+
+        // 维护不同级别文件的变化
         let mut added_files: Vec<Vec<CompactMeta>> = vec![vec![]; 5];
         let mut deleted_files: Vec<HashSet<ColumnFileId>> = vec![HashSet::new(); 5];
+
+        // 这里就是简单的修改map操作
         for ve in version_edits.into_iter() {
             if !ve.add_files.is_empty() {
                 ve.add_files.into_iter().for_each(|f| {
@@ -408,12 +446,15 @@ impl Version {
             }
         }
 
+        // 这里只是简单初始化 没有设置file 列表
         let mut new_levels = LevelInfo::init_levels(
             self.tenant_database.clone(),
             self.ts_family_id,
             self.storage_opt.clone(),
         );
         let weak_tsm_reader_cache = Arc::downgrade(&self.tsm_reader_cache);
+
+        // 遍历当前文件 与 added_files/deleted_files 进行组合
         for level in self.levels_info.iter() {
             for file in level.files.iter() {
                 if deleted_files[file.level as usize].contains(&file.file_id) {
@@ -433,6 +474,7 @@ impl Version {
             new_levels[level.level as usize].update_time_range();
         }
 
+        // 基于新的new_levels 生成version
         let mut new_version = Self {
             ts_family_id: self.ts_family_id,
             tenant_database: self.tenant_database.clone(),
@@ -442,6 +484,7 @@ impl Version {
             levels_info: new_levels,
             tsm_reader_cache: self.tsm_reader_cache.clone(),
         };
+        // 更新最大时间戳
         new_version.update_max_level_ts();
         new_version
     }
@@ -484,13 +527,16 @@ impl Version {
         vec![]
     }
 
+    // 通过指定路径产生reader对象
     pub async fn get_tsm_reader(&self, path: impl AsRef<Path>) -> Result<Arc<TsmReader>> {
         let path = path.as_ref().display().to_string();
+        // 先尝试从缓存获取
         let tsm_reader = match self.tsm_reader_cache.get(&path).await {
             Some(val) => val,
             None => match self.tsm_reader_cache.get(&path).await {
                 Some(val) => val,
                 None => {
+                    // 打开文件 加入缓存
                     let tsm_reader = Arc::new(TsmReader::open(&path).await?);
                     self.tsm_reader_cache.insert(path, tsm_reader.clone()).await;
                     tsm_reader
@@ -501,6 +547,7 @@ impl Version {
     }
 
     // return: l0 , l1-l4 files
+    // 找到与range有时间交集 且包含field的数据文件
     pub fn get_level_files(
         &self,
         time_ranges: &TimeRanges,
@@ -537,6 +584,7 @@ impl Version {
     }
 }
 
+// 缓存组对象 包含一个可变缓存和不可变缓存   缓存也是之后要flush的数据
 #[derive(Debug)]
 pub struct CacheGroup {
     pub mut_cache: Arc<RwLock<MemCache>>,
@@ -544,6 +592,8 @@ pub struct CacheGroup {
 }
 
 impl CacheGroup {
+
+    // 使用2个谓语 和一个handle 处理缓存数据
     pub fn read_field_data(
         &self,
         field_id: FieldId,
@@ -568,6 +618,7 @@ impl CacheGroup {
         );
     }
 
+    // 跟上面类似 通过维护和handle处理缓存数据
     pub fn read_series_timestamps(
         &self,
         series_ids: &[SeriesId],
@@ -585,13 +636,14 @@ impl CacheGroup {
     }
 }
 
+// 相比version 多了一些信息
 #[derive(Debug)]
 pub struct SuperVersion {
     pub ts_family_id: u32,
     pub storage_opt: Arc<StorageOptions>,
-    pub caches: CacheGroup,
+    pub caches: CacheGroup,  // 缓存组 还未落地的数据
     pub version: Arc<Version>,
-    pub version_number: u64,
+    pub version_number: u64,  // 版本号
 }
 
 impl SuperVersion {
@@ -611,6 +663,7 @@ impl SuperVersion {
         }
     }
 
+    // 根据时间范围来筛选数据文件
     pub fn column_files(&self, time_ranges: &TimeRanges) -> Vec<Arc<ColumnFile>> {
         let mut files = Vec::new();
 
@@ -627,6 +680,7 @@ impl SuperVersion {
         files
     }
 
+    // 添加一个坟墓数据  针对多列的多个时间范围
     pub async fn add_tsm_tombstone(
         &self,
         field_ids: &[FieldId],
@@ -634,6 +688,7 @@ impl SuperVersion {
     ) -> Result<()> {
         let version = self.version.clone();
 
+        // 第一步是找到受到影响的文件
         let column_files = version
             .levels_info
             .iter()
@@ -645,11 +700,15 @@ impl SuperVersion {
             })
             .cloned()
             .collect();
+
+
         let mut tsm_iter = ColumnFileToTsmReaderIterator::new(version, column_files);
         loop {
+            // 每次返回一个数据文件
             match tsm_iter.next().await {
                 Some(Ok(tsm)) => {
                     for tr in time_ranges.time_ranges() {
+                        // 坟墓数据在进行compact时生效 在查询时也会跳过
                         tsm.add_tombstone(field_ids, tr).await?;
                     }
                 }
@@ -701,12 +760,13 @@ impl TsfMetrics {
     }
 }
 
+// tsf工厂   用于创建列族
 #[derive(Debug)]
 pub struct TsfFactory {
     // "tenant.db"
     database: Arc<String>,
     options: Arc<Options>,
-    memory_pool: MemoryPoolRef,
+    memory_pool: MemoryPoolRef,   // 通过datafusion的 memoryPool 可以检测内存的消耗量
     metrics_register: Arc<MetricsRegister>,
 }
 impl TsfFactory {
@@ -724,6 +784,7 @@ impl TsfFactory {
         }
     }
 
+    // 根据条件产生一个新的列族
     pub fn create_tsf(
         &self,
         tf_id: TseriesFamilyId,
@@ -731,15 +792,21 @@ impl TsfFactory {
         flush_task_sender: Sender<FlushReq>,
         compact_task_sender: Sender<CompactTask>,
     ) -> TseriesFamily {
+
+        // 缓存对象保存未刷盘的列族数据
         let mut_cache = Arc::new(RwLock::new(MemCache::new(
             tf_id,
             self.options.cache.max_buffer_size,
             self.options.cache.partition,
-            version.last_seq,
+            version.last_seq,  // 新分配的内存块 将沿着之前的版本号
             &self.memory_pool,
         )));
+
+        // TODO
         let tsf_metrics =
             TsfMetrics::new(&self.metrics_register, self.database.as_str(), tf_id as u64);
+
+        // 将相关信息包装成 version
         let super_version = Arc::new(SuperVersion::new(
             tf_id,
             self.options.storage.clone(),
@@ -773,10 +840,12 @@ impl TsfFactory {
     }
 }
 
+// 列族对象还有2个sender对象 用于发送数据刷盘请求 和 数据合并请求
 #[derive(Debug)]
 pub struct TseriesFamily {
     tf_id: TseriesFamilyId,
     tenant_database: Arc<String>,
+    // 分别维护可变缓存和不可变缓存 当执行刷盘任务前 要先将mut_cache 的数据移动到 immut_cache
     mut_cache: Arc<RwLock<MemCache>>,
     immut_cache: Vec<Arc<RwLock<MemCache>>>,
     super_version: Arc<SuperVersion>,
@@ -842,10 +911,14 @@ impl TseriesFamily {
         }
     }
 
+    // 更换内部的版本信息  每个版本的level信息不同 主要体现在数据文件清单不同
     fn new_super_version(&mut self, version: Arc<Version>) {
+        // 增加 version_id
         self.super_version_id.fetch_add(1, Ordering::SeqCst);
         self.tsf_metrics.record_disk_storage(self.disk_storage());
         self.tsf_metrics.record_cache_size(self.cache_size());
+
+        // 更新version
         self.super_version = Arc::new(SuperVersion::new(
             self.tf_id,
             self.storage_opt.clone(),
@@ -860,10 +933,11 @@ impl TseriesFamily {
 
     /// Set new Version into current TsFamily, drop unused immutable caches,
     /// then create new SuperVersion, update seq_no
+    /// 更新缓存和version
     pub fn new_version(
         &mut self,
         new_version: Version,
-        flushed_mem_caches: Option<&Vec<Arc<RwLock<MemCache>>>>,
+        flushed_mem_caches: Option<&Vec<Arc<RwLock<MemCache>>>>,  // 因为已经完成刷盘了 可以从缓存中移除
     ) {
         let version = Arc::new(new_version);
         debug!(
@@ -885,6 +959,7 @@ impl TseriesFamily {
                     new_caches.push(c.clone());
                 }
             }
+            // 仅保留未刷盘的数据  在reader时 cache/level0/level1～4 的数据都要读取
             self.immut_cache = new_caches;
         }
         self.new_super_version(version.clone());
@@ -892,6 +967,7 @@ impl TseriesFamily {
         self.version = version;
     }
 
+    // mut_cache -> immut_cache 并且清空mut_cache
     pub fn switch_to_immutable(&mut self) {
         self.immut_cache.push(self.mut_cache.clone());
         self.mut_cache = Arc::from(RwLock::new(MemCache::new(
@@ -910,7 +986,9 @@ impl TseriesFamily {
     /// If argument `force` is false, total count of immutable caches that
     /// are not flushing or flushed should be greater than configuration `max_immutable_number`.
     /// If argument `force` is set to true, then do not check the total count.
+    /// 产生一个刷盘请求
     pub(crate) fn build_flush_req(&mut self, force: bool) -> Option<FlushReq> {
+        // 在刷盘前 会将缓存数据加载到immut_cache中  这部分数据就是本轮的待刷盘数据
         let mut filtered_caches: Vec<Arc<RwLock<MemCache>>> = self
             .immut_cache
             .iter()
@@ -918,6 +996,7 @@ impl TseriesFamily {
             .cloned()
             .collect();
 
+        // 非强制 且缓存数量没有超过限制的情况下 不需要刷盘
         if !force && filtered_caches.len() < self.cache_opt.max_immutable_number as usize {
             return None;
         }
@@ -928,6 +1007,7 @@ impl TseriesFamily {
             return None;
         }
         let (mut high_seq_no, mut low_seq_no) = (0, u64::MAX);
+        // 此时缓存涉及到的最小/最大序列号
         for mem in filtered_caches.iter() {
             let seq_no = mem.read().seq_no();
             high_seq_no = seq_no.max(high_seq_no);
@@ -945,6 +1025,7 @@ impl TseriesFamily {
 
     /// Try to build a `FlushReq` by immutable caches,
     /// if succeed, send it to flush job.
+    /// 构建一个刷盘请求 通过sender发到下游
     pub(crate) async fn send_flush_req(&mut self, force: bool) {
         if let Some(req) = self.build_flush_req(force) {
             self.flush_task_sender
@@ -954,6 +1035,7 @@ impl TseriesFamily {
         }
     }
 
+    // 将从wal还原出来的系列数据追加到缓存中
     pub fn put_points(
         &self,
         seq: u64,
@@ -965,6 +1047,8 @@ impl TseriesFamily {
             });
         }
         let mut res = 0;
+
+        // 注意不同系列的 schemaId是不同的 也就是列的组合不同 但是写入列的时候 我记得只写入了一次吧?
         for ((sid, _schema_id), group) in points {
             let mem = self.mut_cache.read();
             res += group.rows.len();
@@ -973,6 +1057,7 @@ impl TseriesFamily {
         Ok(res as u64)
     }
 
+    // 检查当前是否满足刷盘条件 并发送刷盘请求
     pub async fn check_to_flush(&mut self) {
         if self.mut_cache.read().is_full() {
             info!(
@@ -986,6 +1071,7 @@ impl TseriesFamily {
         }
     }
 
+    // 更新列族的最后修改时间
     pub async fn update_last_modified(&self) {
         *self.last_modified.write().await = Some(Instant::now());
     }
@@ -994,6 +1080,7 @@ impl TseriesFamily {
         self.status = status;
     }
 
+    // 丢弃某些列的数据   注意只能影响到此时还在内存中的数据  之前的数据不受影响
     pub fn drop_columns(&self, field_ids: &[FieldId]) {
         self.mut_cache.read().drop_columns(field_ids);
         for memcache in self.immut_cache.iter() {
@@ -1001,6 +1088,7 @@ impl TseriesFamily {
         }
     }
 
+    // 修改某列
     pub fn change_column(&self, sids: &[SeriesId], column_name: &str, new_column: &TableColumn) {
         self.mut_cache
             .read()
@@ -1010,6 +1098,7 @@ impl TseriesFamily {
         }
     }
 
+    // 添加新列
     pub fn add_column(&self, sids: &[SeriesId], new_column: &TableColumn) {
         self.mut_cache.read().add_column(sids, new_column);
         for memcache in self.immut_cache.iter() {
@@ -1017,6 +1106,7 @@ impl TseriesFamily {
         }
     }
 
+    // 删除某个系列某个时间范围的数据
     pub fn delete_series(&self, sids: &[SeriesId], time_range: &TimeRange) {
         self.mut_cache.read().delete_series(sids, time_range);
         for memcache in self.immut_cache.iter() {
@@ -1035,6 +1125,7 @@ impl TseriesFamily {
         }
     }
 
+    // 定时调度检测是否需要合并
     pub fn schedule_compaction(&self, runtime: Arc<Runtime>) {
         let tsf_id = self.tf_id;
         let compact_trigger_cold_duration = self.storage_opt.compact_trigger_cold_duration;
@@ -1073,6 +1164,7 @@ impl TseriesFamily {
     /// Snapshots last version before `last_seq` of this vnode.
     ///
     /// Db-files' index data (field-id filter) will be inserted into `file_metas`.
+    /// 根据当前的状态生成一个edit 消耗该edit后将直接生成当前版本 (快照)
     pub fn build_version_edit(
         &self,
         file_metas: &mut HashMap<ColumnFileId, Arc<BloomFilter>>,
@@ -1161,8 +1253,10 @@ impl Drop for TseriesFamily {
     }
 }
 
+// 该迭代器用于遍历数据文件
 pub struct ColumnFileToTsmReaderIterator {
     version: Arc<Version>,
+    // 待遍历的数据文件
     inner_iter: <Vec<Arc<ColumnFile>> as IntoIterator>::IntoIter,
 }
 
@@ -1177,6 +1271,7 @@ impl ColumnFileToTsmReaderIterator {
     pub async fn next(&mut self) -> Option<Result<Arc<TsmReader>>> {
         loop {
             if let Some(f) = self.inner_iter.next() {
+                // 就是简单生成reader对象
                 let tsm_reader = match self.version.get_tsm_reader(f.file_path()).await {
                     Ok(r) => r,
                     Err(e) => {

@@ -37,6 +37,7 @@ pub struct UserInfo {
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Default, Clone)]
 pub enum NodeAttribute {
+    // 怎样算是热节点?
     #[default]
     Hot,
     Cold,
@@ -61,11 +62,14 @@ impl From<String> for NodeAttribute {
     }
 }
 
+// 往集群中添加一个节点
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct NodeInfo {
     pub id: NodeId,
+    // 添加的是一个元数据节点  有自己的http端口地址和grpc地址
     pub grpc_addr: String,
     pub http_addr: String,
+    // 节点处于hot/cold状态
     pub attribute: NodeAttribute,
 }
 
@@ -75,11 +79,15 @@ impl NodeInfo {
     }
 }
 
+
+// 某个节点的测量数据
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct NodeMetrics {
     pub id: NodeId,
+    // 此时空闲的磁盘
     pub disk_free: u64,
     pub time: i64,
+    // 节点是否处于可用状态
     pub status: NodeStatus,
 }
 
@@ -94,6 +102,7 @@ pub struct BucketInfo {
     pub id: u32,
     pub start_time: i64,
     pub end_time: i64,
+    // 每个分片都有一个副本组  所以是一个vec
     pub shard_group: Vec<ReplicationSet>,
 }
 
@@ -105,11 +114,14 @@ impl BucketInfo {
     }
 }
 
+// 代表一个副本集
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq, Hash)]
 pub struct ReplicationSet {
     pub id: ReplicationSetId,
+    // 主副本的id
     pub leader_node_id: NodeId,
     pub leader_vnode_id: VnodeId,
+    // 副本集中所有node信息
     pub vnodes: Vec<VnodeInfo>,
 }
 
@@ -167,6 +179,7 @@ impl VnodeInfo {
     }
 }
 
+// vnode的运行状态
 #[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VnodeStatus {
     #[default]
@@ -175,10 +188,13 @@ pub enum VnodeStatus {
     Broken,
 }
 
+
+// 表示某个vnode的所有信息
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct VnodeAllInfo {
     pub vnode_id: VnodeId,
     pub node_id: NodeId,
+    // 该节点所属的副本集 以及bucket
     pub repl_set_id: u32,
     pub bucket_id: u32,
     pub db_name: String,
@@ -188,6 +204,7 @@ pub struct VnodeAllInfo {
     pub end_time: i64,
 }
 
+// 副本集全信息
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct ReplicaAllInfo {
     pub bucket_id: u32,
@@ -222,10 +239,14 @@ pub type DatabaseInfoRef = Arc<DatabaseInfo>;
 // [VNODE_DURATION <duration>]
 // [REPLICA <n>]
 // [PRECISION {'ms' | 'us' | 'ns'}]]
+// 数据库信息
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct DatabaseInfo {
+    // database的信息 不包含table的schema
     pub schema: DatabaseSchema,
+    // TODO 这些bucket 的信息 目前还不知道是干嘛的
     pub buckets: Vec<BucketInfo>,
+    // 该database下所有table  及其schema
     pub tables: HashMap<String, TableSchema>,
 }
 
@@ -252,10 +273,12 @@ impl DatabaseInfo {
     }
 }
 
+// 维护了租户的元数据信息
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct TenantMetaData {
     pub version: u64,
     // db_name -> database_info
+    // 属于该租户的所有数据库信息
     pub dbs: HashMap<String, DatabaseInfo>,
     pub roles: HashMap<String, CustomTenantRole<Oid>>,
     pub members: HashMap<String, TenantRoleIdentifier>,
@@ -289,6 +312,7 @@ impl TenantMetaData {
         None
     }
 
+    // 找到包含该时间的bucket
     pub fn bucket_by_timestamp(&self, db_name: &str, ts: i64) -> Option<&BucketInfo> {
         if let Some(db) = self.dbs.get(db_name) {
             if let Some(bucket) = db
@@ -303,6 +327,8 @@ impl TenantMetaData {
         None
     }
 
+
+    // 返回有时间交集的bucket
     pub fn mapping_bucket(&self, db_name: &str, start: i64, end: i64) -> Vec<BucketInfo> {
         if let Some(db) = self.dbs.get(db_name) {
             let mut result = vec![];
@@ -339,11 +365,12 @@ pub fn get_time_range(ts: i64, duration: i64) -> (i64, i64) {
     }
 }
 
+// 分配一个副本集
 pub fn allocation_replication_set(
-    nodes: Vec<NodeInfo>,
+    nodes: Vec<NodeInfo>,   // 本次所有考虑分配的节点
     shards: u32,
     replica: u32,
-    begin_seq: u32,
+    begin_seq: u32,  // 本次相关的bucket_id
 ) -> (Vec<ReplicationSet>, u32) {
     let node_count = nodes.len() as u32;
     let mut replica = replica;
@@ -357,6 +384,7 @@ pub fn allocation_replication_set(
     let mut index = 0;
     let mut group = vec![];
 
+    // 每个分片对应一个副本集
     for _ in 0..shards {
         let mut repl_set = ReplicationSet {
             id: incr_id,
@@ -366,6 +394,7 @@ pub fn allocation_replication_set(
         };
         incr_id += 1;
 
+        // 每个副本被看作一个vnode
         for _ in 0..replica {
             repl_set.vnodes.push(VnodeInfo::new(
                 incr_id,
@@ -374,6 +403,8 @@ pub fn allocation_replication_set(
             incr_id += 1;
             index += 1;
         }
+
+        // 默认将第一个副本作为leader
         repl_set.leader_vnode_id = repl_set.vnodes[0].id;
         repl_set.leader_node_id = repl_set.vnodes[0].node_id;
 

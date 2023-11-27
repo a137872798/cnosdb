@@ -12,6 +12,8 @@ impl StatusReplicaSelectionPolicy {
 }
 
 impl ReplicaSelectionPolicy for StatusReplicaSelectionPolicy {
+
+    // 外围是分片数量 内围是副本数量
     fn select(&self, shards: Vec<Vec<VnodeInfo>>, limit: isize) -> Vec<Vec<VnodeInfo>> {
         if limit < 0 {
             return shards;
@@ -20,6 +22,7 @@ impl ReplicaSelectionPolicy for StatusReplicaSelectionPolicy {
         shards
             .into_iter()
             .map(|mut replicas| {
+                // 根据副本的状态来选择 优先选择running
                 replicas.sort_by_key(|k| {
                     // The smaller the score, the easier it is to be selected
                     match k.status {

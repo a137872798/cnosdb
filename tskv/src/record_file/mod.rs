@@ -78,6 +78,7 @@ pub enum RecordDataVersion {
     V1 = 1,
 }
 
+// 不同记录类型 对应不同的数据文件
 #[derive(Debug, Eq, PartialEq, IntoPrimitive, TryFromPrimitive)]
 #[repr(u8)]
 pub enum RecordDataType {

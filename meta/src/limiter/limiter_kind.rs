@@ -2,6 +2,8 @@ use std::fmt::{Display, Formatter};
 
 use serde::{Deserialize, Serialize};
 
+
+// 限流针对的类型
 #[derive(Hash, Eq, PartialEq, Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum RequestLimiterKind {
     CoordDataIn,

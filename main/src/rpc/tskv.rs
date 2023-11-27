@@ -472,6 +472,7 @@ impl TskvService for TskvServiceImpl {
         self.status_response(SUCCESS_RESPONSE_CODE, "".to_string())
     }
 
+    // 作为grpc端口 接收数据写入请求
     async fn exec_raft_write_command(
         &self,
         request: tonic::Request<RaftWriteCommand>,
@@ -506,6 +507,7 @@ impl TskvService for TskvServiceImpl {
         }
     }
 
+    // 接收leader 发出的申请某节点启动的命令
     async fn exec_open_raft_node(
         &self,
         request: tonic::Request<OpenRaftNodeRequest>,
@@ -707,6 +709,7 @@ impl TskvService for TskvServiceImpl {
         }
     }
 
+    // 获取当前存储引擎下某个快照对应的文件元数据
     async fn get_vnode_snap_files_meta(
         &self,
         request: tonic::Request<GetVnodeSnapFilesMetaRequest>,
@@ -715,6 +718,7 @@ impl TskvService for TskvServiceImpl {
         let owner = models::schema::make_owner(&inner.tenant, &inner.db);
         let storage_opt = self.kv_inst.get_storage_options();
 
+        // 找到目录
         let path = storage_opt.snapshot_sub_dir(&owner, inner.vnode_id, inner.snapshot_id.as_str());
         match get_files_meta(&path.as_path().to_string_lossy()).await {
             Ok(files_meta) => {
@@ -726,6 +730,8 @@ impl TskvService for TskvServiceImpl {
     }
 
     type DownloadFileStream = ResponseStream<BatchBytesResponse>;
+
+    // 远端下载文件
     async fn download_file(
         &self,
         request: tonic::Request<DownloadFileRequest>,
@@ -742,6 +748,7 @@ impl TskvService for TskvServiceImpl {
                         break;
                     }
 
+                    // 每当采集到数据时 通过channel发送到recv
                     let _ = send
                         .send(Ok(BatchBytesResponse {
                             code: SUCCESS_RESPONSE_CODE,

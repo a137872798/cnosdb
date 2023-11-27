@@ -19,9 +19,13 @@ use crate::{
     ApplyContext, ApplyStorageRef, EntryStorageRef, RaftNodeId, RaftNodeInfo, Response, TypeConfig,
 };
 
+// 代表被序列化后的快照数据
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct SerializableSnapshot {
+
+    // 记录最后一条日志
     pub last_applied_log: Option<LogId<RaftNodeId>>,
+    // 最后集群中识别到的节点
     pub last_membership: StoredMembership<RaftNodeId, RaftNodeInfo>,
 
     /// Application data.
@@ -37,15 +41,22 @@ pub struct StoredSnapshot {
 }
 
 // #[derive(Clone)]
+// 描述raft节点有关存储的东西
 pub struct NodeStorage {
     id: RaftNodeId,
     info: RaftNodeInfo,
+
+    // 存储一些raft协议需要用到的状态
     state: Arc<StateStorage>,
+    // 这里定义节点处理请求的逻辑
     engine: ApplyStorageRef,
+    // 存储raft日志
     raft_logs: EntryStorageRef,
 }
 
 impl NodeStorage {
+
+    // 将openRaft需要的各个组件组合起来就成了 NodeStorage
     pub fn open(
         id: RaftNodeId,
         info: RaftNodeInfo,
@@ -67,12 +78,15 @@ impl NodeStorage {
     }
 
     pub async fn destory(&self) -> ReplicationResult<()> {
+        // stateStore维护所有raft组的数据 销毁以group为单位
         self.state.del_group(self.group_id())?;
+        // 终止应用层服务
         self.engine.destory().await?;
 
         Ok(())
     }
 
+    // 创建快照
     async fn create_snapshot(&self) -> ReplicationResult<SerializableSnapshot> {
         let data = self.engine.snapshot().await?;
         let snapshot = SerializableSnapshot {
@@ -84,6 +98,7 @@ impl NodeStorage {
         Ok(snapshot)
     }
 
+    // 从快照中进行恢复
     async fn apply_snapshot(&self, sm: SerializableSnapshot) -> ReplicationResult<()> {
         let log_id = sm.last_applied_log.unwrap_or_default();
         self.state.set_last_applied_log(self.group_id(), log_id)?;
@@ -98,6 +113,7 @@ impl NodeStorage {
 
 type StorageResult<T> = Result<T, StorageError<RaftNodeId>>;
 
+// openRaft开放的api 当需要读取raft日志时调用
 #[async_trait]
 impl RaftLogReader<TypeConfig> for Arc<NodeStorage> {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + Send + Sync>(
@@ -130,12 +146,14 @@ impl RaftLogReader<TypeConfig> for Arc<NodeStorage> {
     }
 }
 
+// 描述如何构建快照
 #[async_trait]
 impl RaftSnapshotBuilder<TypeConfig> for Arc<NodeStorage> {
     #[tracing::instrument(level = "trace", skip(self))]
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<RaftNodeId>> {
         debug!("Storage callback build_snapshot");
 
+        // 创建快照
         let snapshot = self
             .create_snapshot()
             .await
@@ -143,6 +161,7 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<NodeStorage> {
         let snap_data =
             bincode::serialize(&snapshot).map_err(|e| StorageIOError::read_state_machine(&e))?;
 
+        // 增加快照偏移量
         let snapshot_idx = self
             .state
             .incr_snapshot_index(self.group_id(), 1)
@@ -165,6 +184,7 @@ impl RaftSnapshotBuilder<TypeConfig> for Arc<NodeStorage> {
             data: snap_data.clone(),
         };
 
+        // 快照数据通过 StateStore存储
         self.state
             .set_snapshot(self.group_id(), snapshot_stored)
             .map_err(|e| StorageIOError::write_state_machine(&e))?;
@@ -181,9 +201,11 @@ impl RaftStorage<TypeConfig> for Arc<NodeStorage> {
     type LogReader = Self;
     type SnapshotBuilder = Self;
 
+    // 获取日志状态
     async fn get_log_state(&mut self) -> StorageResult<LogState<TypeConfig>> {
         debug!("Storage callback get_log_state");
 
+        // 最后一条日志
         let last = self
             .raft_logs
             .last_entry()
@@ -191,6 +213,7 @@ impl RaftStorage<TypeConfig> for Arc<NodeStorage> {
             .map_err(|e| StorageIOError::read_logs(&e))?
             .map(|ent| ent.log_id);
 
+        // 上次清理到的日志
         let last_purged_log_id = self
             .state
             .get_last_purged(self.group_id())
@@ -206,6 +229,7 @@ impl RaftStorage<TypeConfig> for Arc<NodeStorage> {
         })
     }
 
+    // 存储vote信息
     #[tracing::instrument(level = "trace", skip(self))]
     async fn save_vote(&mut self, vote: &Vote<RaftNodeId>) -> Result<(), StorageError<RaftNodeId>> {
         debug!("Storage callback save_vote vote: {:?}", vote);
@@ -219,6 +243,7 @@ impl RaftStorage<TypeConfig> for Arc<NodeStorage> {
         Ok(())
     }
 
+    // 读取vote信息
     async fn read_vote(&mut self) -> Result<Option<Vote<RaftNodeId>>, StorageError<RaftNodeId>> {
         debug!("Storage callback read_vote");
 
@@ -232,6 +257,7 @@ impl RaftStorage<TypeConfig> for Arc<NodeStorage> {
         Ok(vote)
     }
 
+    // 在raft集群中 收到的请求将作为日志保存
     #[tracing::instrument(level = "trace", skip(self, entries))]
     async fn append_to_log<I>(&mut self, entries: I) -> StorageResult<()>
     where
@@ -254,6 +280,7 @@ impl RaftStorage<TypeConfig> for Arc<NodeStorage> {
         Ok(())
     }
 
+    // 当新节点被推举为leader后 之前的节点可能会有一些脏数据 需要清理
     #[tracing::instrument(level = "debug", skip(self))]
     async fn delete_conflict_logs_since(&mut self, log_id: LogId<RaftNodeId>) -> StorageResult<()> {
         debug!(
@@ -269,6 +296,7 @@ impl RaftStorage<TypeConfig> for Arc<NodeStorage> {
         Ok(())
     }
 
+    // 清理指定偏移量前的日志
     #[tracing::instrument(level = "debug", skip(self))]
     async fn purge_logs_upto(
         &mut self,
@@ -288,6 +316,7 @@ impl RaftStorage<TypeConfig> for Arc<NodeStorage> {
         Ok(())
     }
 
+    // 获取最后的状态
     async fn last_applied_state(
         &mut self,
     ) -> Result<
@@ -312,6 +341,7 @@ impl RaftStorage<TypeConfig> for Arc<NodeStorage> {
         Ok((log_id, member_ship))
     }
 
+    // 接受请求 并交给状态机处理  (从协议层到应用层)
     #[tracing::instrument(level = "trace", skip(self, entries))]
     async fn apply_to_state_machine(
         &mut self,
@@ -325,6 +355,7 @@ impl RaftStorage<TypeConfig> for Arc<NodeStorage> {
                 entry.log_id
             );
 
+            // 每个请求都会留档为一条日志
             self.state
                 .set_last_applied_log(self.group_id(), entry.log_id)
                 .map_err(|e| StorageIOError::write(&e))?;
@@ -339,6 +370,7 @@ impl RaftStorage<TypeConfig> for Arc<NodeStorage> {
                         index: entry.log_id.index,
                         raft_id: self.id,
                     };
+                    // 交给应用层处理
                     let rsp = self
                         .engine
                         .apply(&ctx, req)
@@ -348,6 +380,7 @@ impl RaftStorage<TypeConfig> for Arc<NodeStorage> {
                     res.push(rsp);
                 }
 
+                // 代表收到的是一条修改成员关系的请求
                 EntryPayload::Membership(ref mem) => {
                     self.state
                         .set_last_membership(
@@ -364,6 +397,7 @@ impl RaftStorage<TypeConfig> for Arc<NodeStorage> {
         Ok(res)
     }
 
+    // 产生一个空的快照对象 用于接收leader发送过来的快照
     #[tracing::instrument(level = "trace", skip(self))]
     async fn begin_receiving_snapshot(
         &mut self,
@@ -373,6 +407,7 @@ impl RaftStorage<TypeConfig> for Arc<NodeStorage> {
         Ok(Box::new(Cursor::new(Vec::new())))
     }
 
+    // 基于快照恢复本地数据
     #[tracing::instrument(level = "trace", skip(self, snapshot))]
     async fn install_snapshot(
         &mut self,

@@ -22,11 +22,12 @@ use crate::tsm::{
 use crate::{ColumnFileId, Error, LevelId, TseriesFamilyId};
 
 /// Temporary compacting data block meta
+/// 在数据合并过程中用到的临时的元数据
 #[derive(Clone)]
 pub(crate) struct CompactingBlockMeta {
-    reader_idx: usize,
-    reader: Arc<TsmReader>,
-    meta: BlockMeta,
+    reader_idx: usize,   // 对应第几个数据文件
+    reader: Arc<TsmReader>,  // 当前正在读取的数据文件
+    meta: BlockMeta,  // 这个对象是配合reader使用的  便于快速读取DataBlock
 }
 
 impl PartialEq for CompactingBlockMeta {
@@ -62,6 +63,7 @@ impl Display for CompactingBlockMeta {
     }
 }
 
+// 在数据合并过程中 会用到的block元数据
 impl CompactingBlockMeta {
     pub fn new(tsm_reader_idx: usize, tsm_reader: Arc<TsmReader>, block_meta: BlockMeta) -> Self {
         Self {
@@ -71,10 +73,12 @@ impl CompactingBlockMeta {
         }
     }
 
+    // 获得这块数据的时间范围
     pub fn time_range(&self) -> TimeRange {
         self.meta.time_range()
     }
 
+    // 检查2个元数据之间是否有交集
     pub fn overlaps(&self, other: &Self) -> bool {
         self.meta.min_ts() <= other.meta.max_ts() && self.meta.max_ts() >= other.meta.min_ts()
     }
@@ -83,6 +87,7 @@ impl CompactingBlockMeta {
         self.meta.min_ts() <= time_range.max_ts && self.meta.max_ts() >= time_range.min_ts
     }
 
+    // 可以根据元数据信息读取DataBlock
     pub async fn get_data_block(&self) -> Result<DataBlock> {
         self.reader
             .get_data_block(&self.meta)
@@ -97,18 +102,24 @@ impl CompactingBlockMeta {
             .context(error::ReadTsmSnafu)
     }
 
+    // 表示该数据文件是否有相关的坟墓数据
     pub fn has_tombstone(&self) -> bool {
         self.reader.has_tombstone()
     }
 }
 
+// 每个BlockMeta 对应一个DataBlock 在合并过程中会读取到多个数据文件 每个数据块对应一个CompactingBlockMeta
+// CompactingBlockMetaGroup 就对应多个数据块
 #[derive(Clone)]
 pub(crate) struct CompactingBlockMetaGroup {
     field_id: FieldId,
     blk_metas: Vec<CompactingBlockMeta>,
     time_range: TimeRange,
 }
+
 impl CompactingBlockMetaGroup {
+
+    // 一开始只有一个block的数据块
     pub fn new(field_id: FieldId, blk_meta: CompactingBlockMeta) -> Self {
         let time_range = blk_meta.time_range();
         Self {
@@ -127,28 +138,36 @@ impl CompactingBlockMetaGroup {
         self.time_range.merge(&other.time_range);
     }
 
+    // 将内部多个 blk_metas 描述的block数据进行合并
     pub async fn merge(
         mut self,
-        previous_block: Option<CompactingBlock>,
+        previous_block: Option<CompactingBlock>,  // 这个block与本次的group一定是没有时间交集的
         max_block_size: usize,
     ) -> Result<Vec<CompactingBlock>> {
+        // 无block数据 不需要合并
         if self.blk_metas.is_empty() {
             return Ok(vec![]);
         }
+        // 先按照文件顺序排序
         self.blk_metas
             .sort_by(|a, b| a.reader_idx.cmp(&b.reader_idx).reverse());
 
         let merged_block;
+
+        // compact过程中 要顺便去掉墓碑数据  如果没有墓碑数据 相当于不用处理
         if self.blk_metas.len() == 1 && !self.blk_metas[0].has_tombstone() {
             // Only one compacting block and has no tombstone, write as raw block.
             trace!("only one compacting block, write as raw block");
             let meta_0 = &self.blk_metas[0].meta;
             let mut buf_0 = Vec::with_capacity(meta_0.size() as usize);
+
+            // 直接读取原始数据 读取过来的也是编码过的
             let data_len_0 = self.blk_metas[0].get_raw_data(&mut buf_0).await?;
             buf_0.truncate(data_len_0);
 
             if meta_0.size() >= max_block_size as u64 {
                 // Raw data block is full, so do not merge with the previous, directly return.
+                // 当前block已经超过了 maxSize 不需要跟previousBlock合并了
                 let mut merged_blks = Vec::new();
                 if let Some(blk) = previous_block {
                     merged_blks.push(blk);
@@ -160,21 +179,26 @@ impl CompactingBlockMetaGroup {
                 ));
 
                 return Ok(merged_blks);
+
+                // 此时本次block数据没有超过 maxBlock 与上个进行合并
             } else if let Some(compacting_block) = previous_block {
                 // Raw block is not full, so decode and merge with compacting_block.
+                // 要先解码 然后进行数据合并
                 let decoded_raw_block = tsm::decode_data_block(
                     &buf_0,
                     meta_0.field_type(),
                     meta_0.val_off() - meta_0.offset(),
                 )
                 .context(error::ReadTsmSnafu)?;
+
+                // previousBlock 与当前block无时间交集 直接将数据合并在一起即可 难点在于有交集的数据合并
                 let mut data_block = compacting_block.decode()?;
                 data_block.extend(decoded_raw_block);
 
                 merged_block = data_block;
             } else {
                 // Raw block is not full, but nothing to merge with, directly return.
-
+                // 虽然当前block未满 但是还没有previousBlock 所以直接返回即可
                 return Ok(vec![CompactingBlock::raw(
                     self.blk_metas[0].reader_idx,
                     meta_0.clone(),
@@ -183,36 +207,47 @@ impl CompactingBlockMetaGroup {
             }
         } else {
             // One block with tombstone or multi compacting blocks, decode and merge these data block.
+            // 要开始数据合并了  还会顺便去掉墓碑标记的范围数据
             trace!(
                 "there are {} compacting blocks, need to decode and merge",
                 self.blk_metas.len()
             );
             let head = &mut self.blk_metas[0];
+
+            // 读取dataBlock数据 会自动完成decode 以及去除掉坟墓数据
             let mut head_block = head.get_data_block().await?;
 
+
+            // 将previous_block与本block合并 因为这2个block 已经确保没有时间交集了 所以可以直接追加
             if let Some(compacting_block) = previous_block {
                 let mut data_block = compacting_block.decode()?;
                 data_block.extend(head_block);
                 head_block = data_block;
             }
 
+            // 剩下的数据块 进行合并
             for blk_meta in self.blk_metas[1..].iter_mut() {
                 // Merge decoded data block.
                 let blk_block = blk_meta.get_data_block().await?;
+                // 将block 一条条合并 就是通过比较时间戳
                 head_block = head_block.merge(blk_block);
             }
             merged_block = head_block;
         }
 
+        // 将数据块 按照size进行拆解
         self.chunk_merged_block(merged_block, max_block_size)
     }
 
+    // 将数据块 按照size拆分
     fn chunk_merged_block(
         &self,
         data_block: DataBlock,
         max_block_size: usize,
     ) -> Result<Vec<CompactingBlock>> {
         let mut merged_blks = Vec::new();
+
+        // 不需要处理 产生一个表示已经解码过的block
         if max_block_size == 0 || data_block.len() < max_block_size {
             // Data block elements less than max_block_size, do not encode it.
             // Try to merge with the next CompactingBlockMetaGroup.
@@ -221,6 +256,8 @@ impl CompactingBlockMetaGroup {
             let len = data_block.len();
             let mut start = 0;
             let mut end = len.min(max_block_size);
+
+            // 每次读取一个block的大小
             while start + end < len {
                 // Encode decoded data blocks into chunks.
                 let encoded_blk =
@@ -234,6 +271,8 @@ impl CompactingBlockMetaGroup {
                 start += end;
                 end = len.min(start + max_block_size);
             }
+
+            // 剩下的包装成一个block
             if start < len {
                 // Encode the remaining decoded data blocks.
                 let encoded_blk =
@@ -262,17 +301,22 @@ impl CompactingBlockMetaGroup {
 /// - priority: When merging two (timestamp, value) pair with the same
 /// timestamp from two data blocks, pair from data block with lower
 /// priority will be discarded.
+/// 描述合并中的数据块的状态
 pub(crate) enum CompactingBlock {
+
+    // 代表解码后的数据
     Decoded {
         priority: usize,
         field_id: FieldId,
         data_block: DataBlock,
     },
+    // 编码后的数据
     Encoded {
         priority: usize,
         field_id: FieldId,
         data_block: EncodedDataBlock,
     },
+    // 字节流数据
     Raw {
         priority: usize,
         meta: BlockMeta,
@@ -363,16 +407,23 @@ impl CompactingBlock {
     }
 }
 
+// 代表合并中的数据文件
 struct CompactingFile {
+    // 文件序号
     i: usize,
+    // 该对象用于读取底层文件
     tsm_reader: Arc<TsmReader>,
+    // 该迭代器可以缓存最近读取的值
     index_iter: BufferedIterator<IndexIterator>,
+    // 当前正在读取的field
     field_id: Option<FieldId>,
 }
 
 impl CompactingFile {
     fn new(i: usize, tsm_reader: Arc<TsmReader>) -> Self {
+        // 该对象是用于遍历 IndexMeta的
         let mut index_iter = BufferedIterator::new(tsm_reader.index_iterator());
+        // 通过元数据可以知道这是哪一列
         let first_field_id = index_iter.peek().map(|i| i.field_id());
         Self {
             i,
@@ -382,6 +433,7 @@ impl CompactingFile {
         }
     }
 
+    // 弹出最上面的indexMeta  同时更新field_id
     fn next(&mut self) -> Option<&IndexMeta> {
         let idx_meta = self.index_iter.next();
         idx_meta.map(|i| self.field_id.replace(i.field_id()));
@@ -413,8 +465,11 @@ impl PartialOrd for CompactingFile {
     }
 }
 
+// 通过该迭代器 可以将不同reader中的数据合并
 pub(crate) struct CompactIterator {
     tsm_readers: Vec<Arc<TsmReader>>,
+
+    /// 这些reader在一开始就进入了堆中
     compacting_files: BinaryHeap<Pin<Box<CompactingFile>>>,
     /// Maximum values in generated CompactingBlock
     max_data_block_size: usize,
@@ -430,9 +485,12 @@ pub(crate) struct CompactIterator {
     /// tmp_tsm_blks[i] is in self.tsm_readers[ tmp_tsm_blk_tsm_reader_idx[i] ]
     tmp_tsm_blk_tsm_reader_idx: Vec<usize>,
     /// When a TSM file at index i is ended, finished_idxes[i] is set to true.
+    /// 代表读完了几个数据文件
     finished_readers: Vec<bool>,
     /// How many finished_idxes is set to true.
     finished_reader_cnt: usize,
+
+    /// 该迭代器当前正在扫描的field
     curr_fid: Option<FieldId>,
 
     merging_blk_meta_groups: VecDeque<CompactingBlockMetaGroup>,
@@ -458,10 +516,12 @@ impl Default for CompactIterator {
 
 impl CompactIterator {
     pub(crate) fn new(
-        tsm_readers: Vec<Arc<TsmReader>>,
+        tsm_readers: Vec<Arc<TsmReader>>,   // 多个reader的数据 经过迭代器处理后自动合并
         max_data_block_size: usize,
         decode_non_overlap_blocks: bool,
     ) -> Self {
+
+        // 这个堆 对比的是field的id  也就是将所有reader 按列进行读取和合并
         let compacting_files: BinaryHeap<Pin<Box<CompactingFile>>> = tsm_readers
             .iter()
             .enumerate()
@@ -480,9 +540,11 @@ impl CompactIterator {
     }
 
     /// Update tmp_tsm_blks and tmp_tsm_blk_tsm_reader_idx for field id in next iteration.
+    /// 一次性加载所有文件有关某field的数据到tmp迭代器中
     fn next_field_id(&mut self) {
         self.curr_fid = None;
 
+        // 因为每个文件的schema应该是一样的 所以只要看第一个就可以了
         if let Some(f) = self.compacting_files.peek() {
             if self.curr_fid.is_none() {
                 trace!(
@@ -493,16 +555,25 @@ impl CompactIterator {
                 self.curr_fid = f.field_id
             }
         } else {
+            // 这个就是没文件了
             // TODO finished
             trace!("no file to select, mark finished");
             self.finished_reader_cnt += 1;
         }
+
+        // 现在的目标 就是将所有文件同一列的迭代器拉取出来 一起处理
         while let Some(mut f) = self.compacting_files.pop() {
+            // 得到此时正在读取的列
             let loop_field_id = f.field_id;
             let loop_file_i = f.i;
+
+            // 在loop中 将每个文件同一列的数据读取出来
             if self.curr_fid == loop_field_id {
+                // 获取当前indexMeta
                 if let Some(idx_meta) = f.peek() {
+                    // 读取里面的blockMeta 并设置进迭代器
                     self.tmp_tsm_blk_meta_iters.push(idx_meta.block_iterator());
+                    // 获取当前参与本轮field compact的文件
                     self.tmp_tsm_blk_tsm_reader_idx.push(loop_file_i);
                     trace!("merging idx_meta: field_id: {}, field_type: {:?}, block_count: {}, time_range: {:?}",
                         idx_meta.field_id(),
@@ -510,15 +581,18 @@ impl CompactIterator {
                         idx_meta.block_count(),
                         idx_meta.time_range()
                     );
+                    // 把indexMeta 弹出后 重新进入堆  因为此时fieldId发生变化 就不会停留在heap的上面了
                     f.next();
                     self.compacting_files.push(f);
                 } else {
                     // This tsm-file has been finished
+                    // 代表某个文件被读取完了
                     trace!("file {} is finished.", loop_file_i);
                     self.finished_readers[loop_file_i] = true;
                     self.finished_reader_cnt += 1;
                 }
             } else {
+                // 代表所有文件都轮了一遍 该field的数据都已经加载出来了 结束循环
                 self.compacting_files.push(f);
                 break;
             }
@@ -526,7 +600,10 @@ impl CompactIterator {
     }
 
     /// Collect merging `DataBlock`s.
+    /// 根据tmp迭代器中的数据 产生group数据
     async fn fetch_merging_block_meta_groups(&mut self) -> bool {
+
+        // 此时没有待处理的数据 直接返回
         if self.tmp_tsm_blk_meta_iters.is_empty() {
             return false;
         }
@@ -535,13 +612,22 @@ impl CompactIterator {
             None => return false,
         };
 
+        // 每个CompactingBlockMeta 对应一个block迭代器
         let mut blk_metas: Vec<CompactingBlockMeta> =
             Vec::with_capacity(self.tmp_tsm_blk_meta_iters.len());
         // Get all block_meta, and check if it's tsm file has a related tombstone file.
+
+        // 遍历
         for (i, blk_iter) in self.tmp_tsm_blk_meta_iters.iter_mut().enumerate() {
+
+            // 遍历每个block元数据
             for blk_meta in blk_iter.by_ref() {
+
+                // 找到对应数据文件的reader
                 let tsm_reader_idx = self.tmp_tsm_blk_tsm_reader_idx[i];
                 let tsm_reader_ptr = self.tsm_readers[tsm_reader_idx].clone();
+
+                // 将相关信息包起来
                 blk_metas.push(CompactingBlockMeta::new(
                     tsm_reader_idx,
                     tsm_reader_ptr,
@@ -552,8 +638,11 @@ impl CompactIterator {
         // Sort by field_id, min_ts and max_ts.
         blk_metas.sort();
 
+        // 这里已经将多个数据文件某field的block数据放到同一级了
         let mut blk_meta_groups: Vec<CompactingBlockMetaGroup> =
             Vec::with_capacity(blk_metas.len());
+
+        // 将他们包装成group 一开始每个group都只有一个block
         for blk_meta in blk_metas {
             blk_meta_groups.push(CompactingBlockMetaGroup::new(field_id, blk_meta));
         }
@@ -562,6 +651,7 @@ impl CompactIterator {
         loop {
             let mut head_idx = i;
             // Find the first non-empty as head.
+            // 跳过空的 找到第一个有效的group
             for (off, bmg) in blk_meta_groups[i..].iter().enumerate() {
                 if !bmg.is_empty() {
                     head_idx += off;
@@ -572,18 +662,27 @@ impl CompactIterator {
                 // There no other blk_meta_group to merge with the last one.
                 break;
             }
+
+            // 先选择一个header 然后从剩下的元素中找到可以合并的
             let mut head = blk_meta_groups[head_idx].clone();
             i = head_idx + 1;
             for bmg in blk_meta_groups[i..].iter_mut() {
+                // 代表已经被合并过了
                 if bmg.is_empty() {
                     continue;
                 }
+
+                // 有时间交集的 就可以进行合并
                 if head.overlaps(bmg) {
+                    // append后  bmg.len 会被设置成0  也就变空了
                     head.append(bmg);
                 }
             }
+            // 更新head
             blk_meta_groups[head_idx] = head;
         }
+
+        // 上面的操作将block 按照时间交集分成了几个块   有交集的块就可以进行合并
         let blk_meta_groups: VecDeque<CompactingBlockMetaGroup> = blk_meta_groups
             .into_iter()
             .filter(|l| !l.is_empty())
@@ -611,18 +710,25 @@ impl CompactIterator {
 }
 
 impl CompactIterator {
+
+    // 从这些参与合并的数据文件中 返回下一个group  参与合并的都是同一个level的数据文件
     pub(crate) async fn next(&mut self) -> Option<CompactingBlockMetaGroup> {
+        // 先尝试从merging_blk_meta_groups中获取 因为单field可能生成不止一组
         if let Some(g) = self.merging_blk_meta_groups.pop_front() {
             return Some(g);
         }
 
         // For each tsm-file, get next index reader for current iteration field id
+        // changs
+        // 一次性加载所有文件有关某field的数据到tmp迭代器中
         self.next_field_id();
 
         trace!(
             "selected {} blocks meta iterators",
             self.tmp_tsm_blk_meta_iters.len()
         );
+
+        // 代表所有数据都已经读完了
         if self.tmp_tsm_blk_meta_iters.is_empty() {
             trace!("iteration field_id {:?} is finished", self.curr_fid);
             self.curr_fid = None;
@@ -630,6 +736,7 @@ impl CompactIterator {
         }
 
         // Get all of block_metas of this field id, and merge these blocks
+        // 产生CompactingBlockMetaGroup 并填充到merging_blk_meta_groups中
         self.fetch_merging_block_meta_groups().await;
 
         if let Some(g) = self.merging_blk_meta_groups.pop_front() {
@@ -644,8 +751,9 @@ fn overlaps_tuples(r1: (i64, i64), r2: (i64, i64)) -> bool {
     r1.0 <= r2.1 && r1.1 >= r2.0
 }
 
+// 该方法是外部访问的入口
 pub async fn run_compaction_job(
-    request: CompactReq,
+    request: CompactReq,   // req中已经包含本次要合并的数据文件了
     kernel: Arc<GlobalContext>,
 ) -> Result<Option<(VersionEdit, HashMap<ColumnFileId, Arc<BloomFilter>>)>> {
     info!(
@@ -675,13 +783,19 @@ pub async fn run_compaction_job(
     // Buffers all tsm-files and it's indexes for this compaction
     let tsf_id = request.ts_family_id;
     let mut tsm_readers = Vec::new();
+
+    // 为本次涉及到的所有数据文件 生成reader
     for col_file in request.files.iter() {
         let tsm_reader = request.version.get_tsm_reader(col_file.file_path()).await?;
         tsm_readers.push(tsm_reader);
     }
 
     let max_block_size = TseriesFamily::MAX_DATA_BLOCK_SIZE as usize;
+
+    // CompactIterator 每次迭代会产生一个group  在这个group中是各个数据文件针对某个field 有时间交集的部分
     let mut iter = CompactIterator::new(tsm_readers, max_block_size, false);
+
+    // 生成临时文件
     let tsm_dir = request.storage_opt.tsm_dir(&request.database, tsf_id);
     let mut tsm_writer = tsm::new_tsm_writer(&tsm_dir, kernel.file_id_next(), false, 0).await?;
     info!(
@@ -689,13 +803,19 @@ pub async fn run_compaction_job(
         tsm_writer.sequence(),
         request.out_level
     );
+
     let mut version_edit = VersionEdit::new(tsf_id);
     let mut file_metas: HashMap<ColumnFileId, Arc<BloomFilter>> = HashMap::new();
 
+    // 代表之前已经完成合并过的block
     let mut previous_merged_block: Option<CompactingBlock> = None;
     let mut fid = iter.curr_fid;
+
+    // 迭代处理group
     while let Some(blk_meta_group) = iter.next().await {
         trace!("===============================");
+
+        // next() 的调用会推动fid的变化  发现fid不一致时 将上一批数据写完
         if fid.is_some() && fid != iter.curr_fid {
             // Iteration of next field id, write previous merged block.
             if let Some(blk) = previous_merged_block.take() {
@@ -721,9 +841,12 @@ pub async fn run_compaction_job(
         }
 
         fid = iter.curr_fid;
+        // 将group内的block 和 previousBlock 合并成一个block
         let mut compacting_blks = blk_meta_group
             .merge(previous_merged_block.take(), max_block_size)
             .await?;
+
+        // 只有当该block比较小的时候 才考虑作为previous与下个合并
         if compacting_blks.len() == 1 && compacting_blks[0].len() < max_block_size {
             // The only one data block too small, try to extend the next compacting blocks.
             previous_merged_block = Some(compacting_blks.remove(0));
@@ -732,12 +855,17 @@ pub async fn run_compaction_job(
 
         let last_blk_idx = compacting_blks.len() - 1;
         for (i, blk) in compacting_blks.into_iter().enumerate() {
+
+            // 只有当该block比较小的时候 才考虑作为previous与下个合并
             if i == last_blk_idx && blk.len() < max_block_size {
                 // The last data block too small, try to extend to
                 // the next compacting blocks (current field id).
                 previous_merged_block = Some(blk);
+                // block后会进入下次循环
                 break;
             }
+
+            // 将block数据写入数据文件   该方法默认返回false
             if write_tsm(
                 &mut tsm_writer,
                 blk,
@@ -747,6 +875,7 @@ pub async fn run_compaction_job(
             )
             .await?
             {
+
                 tsm_writer = tsm::new_tsm_writer(&tsm_dir, kernel.file_id_next(), false, 0).await?;
                 info!(
                     "Compaction: File: {} been created (level: {}).",
@@ -756,6 +885,8 @@ pub async fn run_compaction_job(
             }
         }
     }
+
+    // 此时已经完成了数据的合并和写入  只需要一个数据文件了 该数据文件的排布还是按列存储 每个列 分为多个block
     if let Some(blk) = previous_merged_block {
         let _max_file_size_exceed = write_tsm(
             &mut tsm_writer,
@@ -766,6 +897,10 @@ pub async fn run_compaction_job(
         )
         .await?;
     }
+
+    // 此时已经完成了所有数据的合并
+
+    // 刷盘 并将变化记录到edit中
     if !tsm_writer.finished() {
         finish_write_tsm(
             &mut tsm_writer,
@@ -777,6 +912,7 @@ pub async fn run_compaction_job(
         .await?;
     }
 
+    // 这些文件不在需要了  在edit中记录为del
     for file in request.files {
         version_edit.del_file(file.level(), file.file_id(), file.is_delta());
     }
@@ -788,6 +924,7 @@ pub async fn run_compaction_job(
     Ok(Some((version_edit, file_metas)))
 }
 
+// 将合并过的数据块写入到 tsm数据文件中
 async fn write_tsm(
     tsm_writer: &mut TsmWriter,
     blk: CompactingBlock,
@@ -795,6 +932,8 @@ async fn write_tsm(
     version_edit: &mut VersionEdit,
     request: &CompactReq,
 ) -> Result<bool> {
+
+    // 在writer中 都开放了相应的api
     let write_ret = match blk {
         CompactingBlock::Decoded {
             field_id: fid,
@@ -846,6 +985,7 @@ async fn write_tsm(
     Ok(false)
 }
 
+// 触发刷盘逻辑
 async fn finish_write_tsm(
     tsm_writer: &mut TsmWriter,
     file_metas: &mut HashMap<ColumnFileId, Arc<BloomFilter>>,
@@ -853,11 +993,16 @@ async fn finish_write_tsm(
     request: &CompactReq,
     max_level_ts: Timestamp,
 ) -> Result<()> {
+
+    // 写入索引数据
     tsm_writer
         .write_index()
         .await
         .context(error::WriteTsmSnafu)?;
+    // 索引数据刷盘
     tsm_writer.finish().await.context(error::WriteTsmSnafu)?;
+
+    // 此时只增加了这一个数据文件
     file_metas.insert(
         tsm_writer.sequence(),
         Arc::new(tsm_writer.bloom_filter_cloned()),
@@ -869,6 +1014,7 @@ async fn finish_write_tsm(
         tsm_writer.size()
     );
 
+    // 将描述元数据保存到edit中
     let cm = new_compact_meta(tsm_writer, request.ts_family_id, request.out_level);
     version_edit.add_file(cm, max_level_ts);
 

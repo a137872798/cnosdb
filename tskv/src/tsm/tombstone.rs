@@ -32,6 +32,7 @@ const FOOTER_MAGIC_NUMBER: u32 = u32::from_be_bytes([b'r', b'o', b'm', b'b']);
 const FOOTER_MAGIC_NUMBER_LEN: usize = 4;
 const ENTRY_LEN: usize = 24; // 8 + 8 + 8
 
+// 坟墓对象  应该是描述某列某个时间范围的数据需要删除
 #[derive(Debug, Clone, Copy)]
 pub struct Tombstone {
     pub field_id: FieldId,
@@ -47,15 +48,19 @@ pub struct Tombstone {
 /// - - min: i64 8 bytes
 /// - - max: i64 8 bytes
 /// - loop end
+/// 维护多个要删除的数据
 pub struct TsmTombstone {
     /// Tombstone caches.
+    /// 记录每个列 要删除哪些时间范围的数据
     tombstones: Mutex<HashMap<FieldId, Vec<TimeRange>>>,
 
+    // 文件地址
     path: PathBuf,
     /// Async record file writer.
     ///
     /// If you want to use self::writer and self::tombstones at the same time,
     /// lock writer first then tombstones.
+    /// 坟墓数据会记录在record文件中
     writer: Arc<AsyncMutex<Option<record_file::Writer>>>,
 }
 
@@ -70,6 +75,8 @@ impl TsmTombstone {
         } else {
             (None, None)
         };
+
+        // 先尝试加载之前的文件数据
         let mut tombstones: HashMap<u64, Vec<TimeRange>> = HashMap::new();
         if let Some(r) = reader.as_mut() {
             Self::load_all(r, &mut tombstones).await?;
@@ -82,6 +89,7 @@ impl TsmTombstone {
         })
     }
 
+    // TODO 忽略测试方法
     #[cfg(test)]
     pub async fn with_path(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -90,6 +98,7 @@ impl TsmTombstone {
         Self::open(parent, tsm_file_id).await
     }
 
+    // 从record文件中恢复
     async fn load_all(
         reader: &mut record_file::Reader,
         tombstones: &mut HashMap<FieldId, Vec<TimeRange>>,
@@ -108,6 +117,7 @@ impl TsmTombstone {
                 );
                 break;
             }
+            // 解析得到信息 加载到内存中
             let field_id = byte_utils::decode_be_u64(&data[0..8]);
             let min_ts = byte_utils::decode_be_i64(&data[8..16]);
             let max_ts = byte_utils::decode_be_i64(&data[16..24]);
@@ -124,13 +134,15 @@ impl TsmTombstone {
         self.tombstones.lock().is_empty()
     }
 
+    // 往坟墓中添加1个时间范围
     pub async fn add_range(
         &self,
         field_ids: &[FieldId],
         time_range: &TimeRange,
-        bloom_filter: Option<Arc<BloomFilter>>,
+        bloom_filter: Option<Arc<BloomFilter>>,   // 需要过滤器中存在的列
     ) -> Result<()> {
         let mut writer_lock = self.writer.lock().await;
+        // 初始化写入对象
         if writer_lock.is_none() {
             *writer_lock =
                 Some(record_file::Writer::open(&self.path, RecordDataType::Tombstone).await?);
@@ -140,6 +152,7 @@ impl TsmTombstone {
             .expect("initialized record file writer");
 
         let mut write_buf = [0_u8; ENTRY_LEN];
+        // 为多个field添加
         for field_id in field_ids.iter() {
             write_buf[0..8].copy_from_slice((*field_id).to_be_bytes().as_slice());
             if let Some(filter) = bloom_filter.as_ref() {
@@ -166,6 +179,7 @@ impl TsmTombstone {
         Ok(())
     }
 
+    // 刷盘record文件
     pub async fn flush(&self) -> Result<()> {
         if let Some(w) = self.writer.lock().await.as_mut() {
             w.sync().await?;
@@ -174,10 +188,12 @@ impl TsmTombstone {
     }
 
     /// Returns all TimeRanges for a FieldId cloned from TsmTombstone.
+    /// 获取某个列相关的时间范围
     pub(crate) fn get_cloned_time_ranges(&self, field_id: FieldId) -> Option<Vec<TimeRange>> {
         self.tombstones.lock().get(&field_id).cloned()
     }
 
+    // 判断时间范围是否有重复
     pub fn overlaps(&self, field_id: FieldId, time_range: &TimeRange) -> bool {
         if let Some(time_ranges) = self.tombstones.lock().get(&field_id) {
             for t in time_ranges.iter() {
@@ -213,6 +229,7 @@ impl TsmTombstone {
         None
     }
 
+    // 在数据块上 剔除被标记成删除的时间范围
     pub fn data_block_exclude_tombstones(&self, field_id: FieldId, data_block: &mut DataBlock) {
         if let Some(tr_tuple) = data_block.time_range() {
             let time_range: &TimeRange = &tr_tuple.into();
@@ -226,6 +243,7 @@ impl TsmTombstone {
     }
 
     // if no exclude, return None
+    // 实际上做的事和上面一样
     pub fn data_block_exclude_tombstones_new(
         &self,
         field_id: FieldId,

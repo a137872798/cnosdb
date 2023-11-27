@@ -10,16 +10,19 @@ use crate::tseries_family::{ColumnFile, SuperVersion};
 use crate::tsm::{self, BlockMeta, TsmReader};
 use crate::{Error, Result};
 
+// 描述时间范围
 #[derive(PartialEq, Eq)]
 pub enum TimeRangeCmp {
-    /// A has no intersection with B
+    /// A has no intersection with B   A/B无交集
     Exclude,
-    /// A includes B
+    /// A includes B    A包含B
     Include,
-    /// A overlaps with B
+    /// A overlaps with B     A与B有交集
     Intersect,
 }
 
+
+// 代表计数类型 字段或者series
 enum CountingObject {
     Field(FieldId),
     Series(SeriesId),
@@ -31,15 +34,17 @@ enum CountingObject {
 pub async fn count_column_non_null_values(
     runtime: Arc<Runtime>,
     super_version: Arc<SuperVersion>,
-    series_ids: Arc<Vec<SeriesId>>,
-    column_id: Option<ColumnId>,
+    series_ids: Arc<Vec<SeriesId>>,  // 多个系列id
+    column_id: Option<ColumnId>,  // 被检查的列
     time_ranges: Arc<TimeRanges>,
 ) -> Result<u64> {
     let column_files = Arc::new(super_version.column_files(&time_ranges));
     let mut jh_vec = Vec::with_capacity(series_ids.len());
 
+    // 按照系列id分开计算
     for series_id in series_ids.iter() {
         let count_object = if let Some(column_id) = column_id {
+            // 组合生成一个id
             let field_id = model_utils::unite_id(column_id, *series_id);
             CountingObject::Field(field_id)
         } else {

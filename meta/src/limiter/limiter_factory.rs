@@ -26,7 +26,7 @@ pub trait LimiterFactory: Debug + Send + Sync {
 #[derive(Debug)]
 pub struct LocalRequestLimiterFactory {
     cluster_name: String,
-    meta_http_client: MetaHttpClient,
+    meta_http_client: MetaHttpClient,  // 因为要访问元数据服务器  所以需要client  在client内部维护了所有元数据服务器地址 会自动做路由
 }
 impl LocalRequestLimiterFactory {
     pub fn new(cluster_name: String, meta_http_client: MetaHttpClient) -> Self {
@@ -37,6 +37,7 @@ impl LocalRequestLimiterFactory {
     }
 }
 
+// 本地限流器工厂
 #[async_trait::async_trait]
 impl LimiterFactory for LocalRequestLimiterFactory {
     async fn create_default(&self, key: LimiterKey) -> MetaResult<Arc<dyn RequestLimiter>> {
@@ -49,10 +50,14 @@ impl LimiterFactory for LocalRequestLimiterFactory {
             .ok_or_else(|| MetaError::TenantNotFound {
                 tenant: tenant_name.clone(),
             })?;
+
+        // 这是目前的限流配置   也就是基于元数据服务器上该租户相关的限流信息生成本地限流器
         let limiter_config = LimiterConfig::TenantRequestLimiterConfig {
             tenant: tenant_name,
             config: Box::new(tenant.options().request_config().cloned()),
         };
+
+        // 生成限流器
         let limiter = self.create_limiter(limiter_config).await?;
         Ok(limiter)
     }

@@ -9,15 +9,20 @@ use crate::limiter::local_request_limiter::{LocalBucketRequest, LocalBucketRespo
 use crate::store::command::*;
 use crate::store::key_path::KeyPath;
 
+// 用于拉取元数据的客户端
 #[derive(Debug, Clone)]
 pub struct MetaHttpClient {
+    // 这是一个http库
     inner: Arc<reqwest::Client>,
+    // 看来维护元数据的服务器是多节点的  应该是用了选举算法
     addrs: Vec<String>,
+    // 此时被选举出来的leader节点地址
     pub leader: Arc<RwLock<String>>,
 }
 
 impl MetaHttpClient {
     /// Create new MetaHttpClient. Param `attrs` is meta server addresses split by character ';'.
+    /// 通过一组节点地址进行初始化
     pub fn new(addrs: &str) -> Self {
         let mut addrs: Vec<String> = addrs.split(';').map(|s| s.to_string()).collect();
         addrs.sort();
@@ -29,6 +34,8 @@ impl MetaHttpClient {
             leader: Arc::new(RwLock::new(leader_addr)),
         }
     }
+
+    // 各种command 都会尝试发送给leader
 
     pub async fn read<T>(&self, req: &ReadCommand) -> MetaResult<T>
     where
@@ -52,6 +59,7 @@ impl MetaHttpClient {
         })?
     }
 
+    // cnosdb服务可以监听元数据的变化
     pub async fn watch<T>(&self, req: &(String, String, HashSet<String>, u64)) -> MetaResult<T>
     where
         T: for<'a> Deserialize<'a>,
@@ -63,6 +71,7 @@ impl MetaHttpClient {
         })?
     }
 
+    // 检测leader地址
     pub async fn meta_leader(&self) -> MetaResult<String> {
         let command = WriteCommand::Set {
             key: KeyPath::test_alive(),
@@ -77,6 +86,7 @@ impl MetaHttpClient {
     }
 
     // ----------------------------------------------------------- //
+    // 在没有被明确告知leader地址时 会挨个尝试
     async fn switch_leader(&self) {
         let mut t = self.leader.write();
 
@@ -88,6 +98,7 @@ impl MetaHttpClient {
         }
     }
 
+    // 尝试发送给leader 支持重试
     async fn try_send_to_leader<Req>(&self, uri: &str, req: &Req) -> MetaResult<String>
     where
         Req: Serialize + 'static,
@@ -108,6 +119,7 @@ impl MetaHttpClient {
         }
     }
 
+    // client/server之间是通过grpc协议通信的
     async fn send_rpc_to_leader<Req>(&self, uri: &str, req: &Req) -> MetaResult<String>
     where
         Req: Serialize + 'static,
@@ -117,6 +129,7 @@ impl MetaHttpClient {
             Ok(res) => match res {
                 Ok(data) => Ok(data),
 
+                // leader发生了变化
                 Err(err) => {
                     if let MetaError::ChangeLeader { new_leader } = &err {
                         let mut t = self.leader.write();
@@ -139,6 +152,7 @@ impl MetaHttpClient {
         }
     }
 
+    // 将请求发往leader
     async fn do_send_rpc_to_leader<Req>(&self, uri: &str, req: &Req) -> MetaResult<String>
     where
         Req: Serialize + 'static,
@@ -169,6 +183,7 @@ impl MetaHttpClient {
         }
     }
 
+    // 发送一个申请permit的请求
     pub async fn limiter_request(
         &self,
         cluster: &str,

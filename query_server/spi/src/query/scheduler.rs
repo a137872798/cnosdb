@@ -7,6 +7,7 @@ use datafusion::physical_plan::{ExecutionPlan, SendableRecordBatchStream};
 
 pub type SchedulerRef = Arc<dyn Scheduler + Send + Sync>;
 
+// 调度器对象
 #[async_trait]
 pub trait Scheduler {
     /// Schedule the provided [`ExecutionPlan`] on this [`Scheduler`].
@@ -15,8 +16,8 @@ pub trait Scheduler {
     /// as a [`futures::Stream`] of [`RecordBatch`]
     async fn schedule(
         &self,
-        plan: Arc<dyn ExecutionPlan>,
-        context: Arc<TaskContext>,
+        plan: Arc<dyn ExecutionPlan>,  // 已经产生执行计划了  也就是过了优化阶段
+        context: Arc<TaskContext>,  // 维护一次查询相关的信息
     ) -> Result<ExecutionResults>;
 }
 

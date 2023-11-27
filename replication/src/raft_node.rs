@@ -10,6 +10,7 @@ use crate::network_client::NetworkConn;
 use crate::node_store::NodeStorage;
 use crate::{ApplyStorageRef, OpenRaftNode, RaftNodeId, RaftNodeInfo};
 
+// 将相关的组件合在一起 成为了RaftNode
 #[derive(Clone)]
 pub struct RaftNode {
     id: RaftNodeId,
@@ -33,6 +34,7 @@ impl RaftNode {
 
         let (log_store, state_machine) = Adaptor::new(storage.clone());
 
+        // 该对象负责raft节点之间的通信
         let network = NetworkConn::new();
         let raft = openraft::Raft::new(id, config.clone(), network, log_store, state_machine)
             .await
@@ -63,6 +65,7 @@ impl RaftNode {
     }
 
     /// Initialize a single-node cluster.
+    /// 看来这个raft包支持节点数量变化  一开始raft集群只有一个节点
     pub async fn raft_init(
         &self,
         nodes: BTreeMap<RaftNodeId, RaftNodeInfo>,

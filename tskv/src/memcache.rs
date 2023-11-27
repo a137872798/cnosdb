@@ -23,16 +23,19 @@ use utils::bitset::ImmutBitSet;
 use crate::error::Result;
 use crate::{byte_utils, Error, TseriesFamilyId};
 
+// 代表一个列值
 #[derive(Debug, Clone)]
 pub enum FieldVal {
     Float(f64),
     Integer(i64),
     Unsigned(u64),
     Boolean(bool),
-    Bytes(MiniVec<u8>),
+    Bytes(MiniVec<u8>),  // 一组字节
 }
 
 impl FieldVal {
+
+    // 获取数值的类型
     pub fn value_type(&self) -> ValueType {
         match self {
             FieldVal::Float(..) => ValueType::Float,
@@ -43,6 +46,7 @@ impl FieldVal {
         }
     }
 
+    // 将值和时间戳 合在一起变成 DataType
     pub fn data_value(&self, ts: i64) -> DataType {
         match self {
             FieldVal::Float(val) => DataType::F64(ts, *val),
@@ -55,6 +59,7 @@ impl FieldVal {
 
     pub fn new(val: MiniVec<u8>, vtype: ValueType) -> FieldVal {
         match vtype {
+            // 未声明类型 按照u64解读
             ValueType::Unsigned => {
                 let val = byte_utils::decode_be_u64(&val);
                 FieldVal::Unsigned(val)
@@ -79,6 +84,7 @@ impl FieldVal {
         }
     }
 
+    // 只有 bytes (指针) 消耗内存 其他都是栈内存
     pub fn heap_size(&self) -> usize {
         if let FieldVal::Bytes(val) = self {
             val.capacity()
@@ -115,44 +121,68 @@ impl PartialEq for FieldVal {
 
 impl Eq for FieldVal {}
 
+// 代表一行数据
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RowData {
+    // 某行数据对应一个时间戳
     pub ts: i64,
+    // 该行下各字段数据
     pub fields: Vec<Option<FieldVal>>,
 }
 
 impl RowData {
+
+    // 从各向量中读取某列的值  并转换成行数据
     pub fn point_to_row_data(
-        schema: &TskvTableSchema,
+        schema: &TskvTableSchema,  // 记录当前表的schema
         from_precision: Precision,
-        columns: &Vector<ForwardsUOffset<Column>>,
-        fields_idx: &[usize],
-        ts_idx: usize,
-        row_count: usize,
+        columns: &Vector<ForwardsUOffset<Column>>,  // 包含列数据 以及偏移量信息   这个Column数据中是包含位图的
+        fields_idx: &[usize],  // 应该是代表值需要读取这几列的数据
+        ts_idx: usize,  // 描述存储时间戳的列的下标
+        row_count: usize,  // 代表读取每列的第几行数据
     ) -> Result<RowData> {
+
+        // 代表该行至少有一列有数据
         let mut has_fields = false;
+        // 这个向量用于存储行数据
         let mut fields = vec![None; schema.field_num()];
+
+        // 发现也是列式存储
+
+        // value是序列
         let fields_id = schema.fields_id();
         for field_id in fields_idx {
+            // 得到col信息
             let column = columns.get(*field_id);
+            // 读取4字节长度 得到name
             let column_name = column.name_ext()?;
+            // 用12字节存储位图信息
             let column_nullbit = column.nullbit_ext()?;
+
+            // 根据不同类型 知道要读取多少长度
             match column.field_type() {
                 FieldType::Integer => {
+                    // 描述记录了多少个值
                     let len = column.int_values_len()?;
                     let column_nullbits =
                         ImmutBitSet::new_without_check(len, column_nullbit.bytes());
+                    // 通过查看位图对应的位置是否为1  确认该列在该行是否有数据
                     if !column_nullbits.get(row_count) {
                         continue;
                     }
+
+                    // 读取该行的值
                     let val = column.int_values()?.get(row_count);
                     match schema.column(column_name) {
                         None => {
                             error!("column {} not found in schema", column_name);
                         }
+                        // 获取列的元数据信息
                         Some(column) => {
                             let field_id = column.id;
+                            // 通过列id得到序号  因为fields_id 对col进行过排序
                             let field_idx = fields_id.get(&field_id).unwrap();
+                            // 设置列的值
                             fields[*field_idx] = Some(FieldVal::Integer(val));
                             has_fields = true;
                         }
@@ -245,20 +275,26 @@ impl RowData {
             }
         }
 
+        // 代表该行无数据
         if !has_fields {
             return Err(Error::InvalidPoint);
         }
 
+        // 获取时间列
         let ts_column = columns.get(ts_idx);
+        // 获取该行对应的时间戳
         let ts = ts_column.int_values()?.get(row_count);
+        // 获取时间戳精度
         let to_precision = schema.time_column_precision();
         let ts = timestamp_convert(from_precision, to_precision, ts).ok_or(Error::CommonError {
             reason: "timestamp overflow".to_string(),
         })?;
 
+        // 将时间戳和这些列信息组合在一起  作为行数据
         Ok(RowData { ts, fields })
     }
 
+    // 该对象占用的内存大小
     pub fn size(&self) -> usize {
         let mut size = 0;
         for i in self.fields.iter() {
@@ -277,23 +313,31 @@ impl RowData {
     }
 }
 
+// 行组 将多行看作一个group
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RowGroup {
+    // 包含各col的信息  每当col发生变化 版本号会递增
     pub schema: Arc<TskvTableSchema>,
+    // 该行组的时间范围  (最小行到最大行对应的时间)
     pub range: TimeRange,
+    // 行数据以链表形式连接
     pub rows: LinkedList<RowData>,
     /// total size in stack and heap
     pub size: usize,
 }
 
+// 系列数据 简单看是 RowGroup更上一层维度
 #[derive(Debug)]
 pub struct SeriesData {
     pub series_id: SeriesId,
+    // 更大的时间范围
     pub range: TimeRange,
     pub groups: LinkedList<RowGroup>,
 }
 
 impl SeriesData {
+
+    // 初始化系列数据对象
     fn new(series_id: SeriesId) -> Self {
         Self {
             series_id,
@@ -305,9 +349,11 @@ impl SeriesData {
         }
     }
 
+    // 系列数据每次以 行组为单位进行写入
     pub fn write(&mut self, mut group: RowGroup) {
         self.range.merge(&group.range);
 
+        // 相同schema的行组数据会进行合并
         for item in self.groups.iter_mut() {
             if item.schema.schema_id == group.schema.schema_id {
                 item.range.merge(&group.range);
@@ -317,9 +363,11 @@ impl SeriesData {
             }
         }
 
+        // 不同schema的数据 会挂到链表上
         self.groups.push_back(group);
     }
 
+    // 在各schema上 去掉该col数据
     pub fn drop_column(&mut self, column_id: ColumnId) {
         for item in self.groups.iter_mut() {
             let name = match item.schema.column_name(column_id) {
@@ -330,9 +378,11 @@ impl SeriesData {
                 None => continue,
                 Some(index) => *index,
             };
+            // 在每行数据上去掉该col
             for row in item.rows.iter_mut() {
                 row.fields.remove(index);
             }
+            // 更新schema信息
             let mut schema_t = item.schema.as_ref().clone();
             schema_t.drop_column(&name);
             //schema_t.schema_id += 1;
@@ -340,6 +390,9 @@ impl SeriesData {
         }
     }
 
+    // 新增或者修改schema 在查询时会产生什么影响呢
+
+    // 修改某列信息  但是看起来不会影响到 RowGroup 的数据？
     pub fn change_column(&mut self, column_name: &str, new_column: &TableColumn) {
         for item in self.groups.iter_mut() {
             let mut schema_t = item.schema.as_ref().clone();
@@ -349,6 +402,7 @@ impl SeriesData {
         }
     }
 
+    // 添加一列 只修改schema 不影响原来行组的数据
     pub fn add_column(&mut self, new_column: &TableColumn) {
         for item in self.groups.iter_mut() {
             let mut schema_t = item.schema.as_ref().clone();
@@ -358,12 +412,15 @@ impl SeriesData {
         }
     }
 
+    // 删除时间范围覆盖的数据
     pub fn delete_series(&mut self, range: &TimeRange) {
+        // 时间无交集 不需要删除
         if range.max_ts < self.range.min_ts || range.min_ts > self.range.max_ts {
             return;
         }
 
         for item in self.groups.iter_mut() {
+            // 只保留时间范围在range之外的
             item.rows = item
                 .rows
                 .iter()
@@ -373,6 +430,7 @@ impl SeriesData {
         }
     }
 
+    // 根据一组时间范围删除
     pub fn delete_by_time_ranges(&mut self, time_ranges: &TimeRanges) {
         for time_range in time_ranges.time_ranges() {
             if time_range.max_ts < self.range.min_ts || time_range.min_ts > self.range.max_ts {
@@ -390,6 +448,7 @@ impl SeriesData {
         }
     }
 
+    // 根据谓语查询数据
     pub fn read_data(
         &self,
         column_id: ColumnId,
@@ -398,6 +457,7 @@ impl SeriesData {
         mut handle_data: impl FnMut(DataType),
     ) {
         for group in self.groups.iter() {
+            // 这些行组的schema都是不同的   相同schema的数据将会合并到一个行组中
             let field_index = group.schema.fields_id();
             let index = match field_index.get(&column_id) {
                 None => continue,
@@ -406,10 +466,13 @@ impl SeriesData {
             group
                 .rows
                 .iter()
+                // 先根据时间谓语过滤
                 .filter(|row| time_predicate(row.ts))
                 .for_each(|row| {
+                    // 读取该列的值 并判断是否满足条件
                     if let Some(Some(field)) = row.fields.get(*index) {
                         if value_predicate(field) {
+                            // 处理数据
                             handle_data(field.data_value(row.ts))
                         }
                     }
@@ -417,6 +480,7 @@ impl SeriesData {
         }
     }
 
+    // 处理满足时间谓语的数据
     pub fn read_timestamps(
         &self,
         mut time_predicate: impl FnMut(Timestamp) -> bool,
@@ -431,6 +495,7 @@ impl SeriesData {
         }
     }
 
+    // 平铺开展示
     pub fn flat_groups(&self) -> Vec<(SchemaId, TskvTableSchemaRef, &LinkedList<RowData>)> {
         self.groups
             .iter()
@@ -439,36 +504,49 @@ impl SeriesData {
     }
 }
 
+// 缓存对象
 #[derive(Debug)]
 pub struct MemCache {
+
+    // 对应一个vnodeId  因为一个vnode下可能有多个系列 所以又被称作 列族
     tf_id: TseriesFamilyId,
 
+    // 是否正在刷盘
     flushing: AtomicBool,
 
+    // 缓存大小
     max_size: u64,
+    // 缓存中最小数据的序列
     min_seq_no: u64,
 
-    // wal seq number
+    // wal seq number  当前序列号  当写入新数据时 序列号也会跟着更新
     seq_no: AtomicU64,
+    // 该对象描述内存消耗
     memory: RwLock<MemoryReservation>,
 
     part_count: usize,
     // This u64 comes from split_id(SeriesId) % part_count
+    // 二重维度 外层代表分区 内层是系列id 与系列数据
+    // 应该是考虑到某个节点的多个分片有可能出现在同一个节点上
     partions: Vec<RwLock<HashMap<u32, RwLockRef<SeriesData>>>>,
 }
 
+
+// 针对每个vnode都有一个 缓存对象
 impl MemCache {
     pub fn new(
-        tf_id: TseriesFamilyId,
+        tf_id: TseriesFamilyId,  // vnodeid
         max_size: u64,
-        part_count: usize,
-        seq: u64,
+        part_count: usize,  // 有多少分区数据落在该节点上
+        seq: u64,  // 序列号
         pool: &MemoryPoolRef,
     ) -> Self {
         let mut partions = Vec::with_capacity(part_count);
         for _i in 0..part_count {
             partions.push(RwLock::new(HashMap::new()));
         }
+
+        // 将消费者注册到pool上 可以追踪该对象的内存消耗
         let res =
             RwLock::new(MemoryConsumer::new(format!("memcache-{}-{}", tf_id, seq)).register(pool));
         Self {
@@ -486,14 +564,20 @@ impl MemCache {
         }
     }
 
+    // 将行组数据写入缓存
     pub fn write_group(&self, sid: SeriesId, seq: u64, group: RowGroup) -> Result<()> {
         self.seq_no.store(seq, Ordering::Relaxed);
+        // 从pool中申请内存
         self.memory
             .write()
             .try_grow(group.size)
             .map_err(|_| Error::MemoryExhausted)?;
+
+        // 系列id 的分配是跟分区数挂钩的
         let index = (sid as usize) % self.part_count;
         let mut series_map = self.partions[index].write();
+
+        // 写入行组数据
         if let Some(series_data) = series_map.get(&sid) {
             let series_data_ptr = series_data.clone();
             let mut series_data_ptr_w = series_data_ptr.write();
@@ -509,7 +593,7 @@ impl MemCache {
 
     pub fn read_field_data(
         &self,
-        field_id: FieldId,
+        field_id: FieldId,  // 同时包含了系列和列信息
         time_predicate: impl FnMut(Timestamp) -> bool,
         value_predicate: impl FnMut(&FieldVal) -> bool,
         handle_data: impl FnMut(DataType),
@@ -517,6 +601,8 @@ impl MemCache {
         let (column_id, sid) = split_id(field_id);
         let index = (sid as usize) % self.part_count;
         let series_data = self.partions[index].read().get(&sid).cloned();
+
+        // 针对该系列下所有行组 进行处理
         if let Some(series_data) = series_data {
             series_data
                 .read()
@@ -524,6 +610,7 @@ impl MemCache {
         }
     }
 
+    // 同上
     pub fn read_series_timestamps(
         &self,
         series_ids: &[SeriesId],
@@ -551,6 +638,7 @@ impl MemCache {
         true
     }
 
+    // 丢弃某些列的数据
     pub fn drop_columns(&self, field_ids: &[FieldId]) {
         for fid in field_ids {
             let (column_id, sid) = split_id(*fid);
@@ -561,6 +649,8 @@ impl MemCache {
             }
         }
     }
+
+    // 下面都是一些转发操作了 主要就是解析seriesId 找到目标 seriesData
 
     pub fn change_column(&self, sids: &[SeriesId], column_name: &str, new_column: &TableColumn) {
         for sid in sids {
@@ -582,6 +672,7 @@ impl MemCache {
         }
     }
 
+    // 删除某个系列某个范围数据
     pub fn delete_series(&self, sids: &[SeriesId], range: &TimeRange) {
         for sid in sids {
             let index = (*sid as usize) % self.part_count;
@@ -602,6 +693,7 @@ impl MemCache {
         }
     }
 
+    // 读取一份数据副本
     pub fn read_series_data(&self) -> Vec<(SeriesId, Arc<RwLock<SeriesData>>)> {
         let mut ret = Vec::new();
         self.partions.iter().for_each(|p| {
@@ -613,6 +705,7 @@ impl MemCache {
         ret
     }
 
+    // 标记成正在刷盘
     pub fn mark_flushing(&self) -> bool {
         self.flushing
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -648,6 +741,7 @@ impl MemCache {
     }
 }
 
+// 代表一个列值  (在cnosdb中每个列值都要关联时间戳)
 #[derive(Debug, Clone)]
 pub enum DataType {
     U64(i64, u64),
@@ -683,6 +777,8 @@ impl Ord for DataType {
 }
 
 impl DataType {
+
+    // 将某列的值 与时间戳关联起来
     pub fn new(vtype: ValueType, ts: i64) -> Self {
         match vtype {
             ValueType::Unsigned => DataType::U64(ts, 0),

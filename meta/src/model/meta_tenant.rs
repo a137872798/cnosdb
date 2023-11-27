@@ -23,13 +23,17 @@ use crate::store::command::{EntryLog, ReadCommand};
 use crate::store::key_path;
 use crate::{client, store};
 
+// 记录某个租户的元数据信息
 #[derive(Debug)]
 pub struct TenantMeta {
     cluster: String,
+    // 租户上还有一个抽象层 (集群)
     tenant: Tenant,
+    // 元数据服务地址
     meta_url: String,
-
+    // 租户数据
     data: RwLock<TenantMetaData>,
+    // 通过客户端读取元数据
     client: MetaHttpClient,
 }
 
@@ -44,6 +48,7 @@ impl TenantMeta {
         }
     }
 
+    // 创建租户相关的元数据
     pub async fn new(cluster: String, tenant: Tenant, meta_url: String) -> MetaResult<Arc<Self>> {
         let client = Arc::new(Self {
             cluster,
@@ -53,6 +58,7 @@ impl TenantMeta {
             client: MetaHttpClient::new(&meta_url),
         });
 
+        // 同步所有租户相关的元数据
         client.sync_all_tenant_metadata().await?;
 
         Ok(client)
@@ -70,6 +76,7 @@ impl TenantMeta {
         Ok(())
     }
 
+    // 检查目前集群是否支持创建某配置的db
     fn check_create_db(&self, db_schema: &mut DatabaseSchema) -> MetaResult<()> {
         let limiter_config = match self.tenant.options().object_config() {
             Some(config) => config,
@@ -85,6 +92,8 @@ impl TenantMeta {
         } = limiter_config;
 
         let db_num = self.data.read().dbs.len();
+
+        // 租户有db数量限制
         if let Some(max) = max_databases {
             if db_num >= *max {
                 return Err(MetaError::ObjectLimit {
@@ -96,6 +105,7 @@ impl TenantMeta {
             }
         }
 
+        // 副本限制
         let replica = db_schema.config.replica_or_default();
         if let Some(max) = max_replicate_number {
             if replica as usize > *max {
@@ -108,6 +118,7 @@ impl TenantMeta {
             }
         }
 
+        // 分片限制
         let shard = db_schema.config.shard_num_or_default();
         if let Some(max) = max_shard_number {
             if shard as usize > *max {
@@ -120,6 +131,7 @@ impl TenantMeta {
             }
         }
 
+        // 数据保留时间不能超过租户配置上限
         match (db_schema.config.ttl(), max_retention_time) {
             (Some(ttl), Some(day)) => {
                 let ttl = ttl.to_nanoseconds();
@@ -151,6 +163,7 @@ impl TenantMeta {
 
         let user_number = self.data.read().members.len();
 
+        // 有用户数量限制
         if let Some(max) = max_users_number {
             if user_number >= *max {
                 return Err(MetaError::ObjectLimit {
@@ -169,6 +182,7 @@ impl TenantMeta {
         self.tenant().name().to_string()
     }
 
+    // 给用户关联角色
     pub async fn add_member_with_role(
         &self,
         user_id: Oid,
@@ -529,6 +543,7 @@ impl TenantMeta {
                 .ok_or(MetaError::DatabaseNotFound {
                     database: val.db.clone(),
                 })?;
+            // 更新本地缓存
             db.tables
                 .insert(val.name.clone(), TableSchema::TsKvTableSchema(val.clone()));
             return Ok(Some(val));
@@ -606,10 +621,12 @@ impl TenantMeta {
         self.data.read().database_min_ts(name)
     }
 
+    // 返回该租户下所有过期的时间桶
     pub fn expired_bucket(&self) -> Vec<ExpiredBucketInfo> {
         let mut list = vec![];
         for (key, val) in self.data.read().dbs.iter() {
             for bucket in val.buckets.iter() {
+                // time_to_expired 是数据的最大保留时间 这之前的数据都不再保留了
                 if bucket.end_time < val.schema.time_to_expired() {
                     let info = ExpiredBucketInfo {
                         tenant: self.tenant_name(),
@@ -653,6 +670,7 @@ impl TenantMeta {
         None
     }
 
+    // 返回某个副本集的信息
     pub fn get_replica_all_info(&self, repl_id: u32) -> Option<ReplicaAllInfo> {
         let data = self.data.read();
         for (db_name, db_info) in data.dbs.iter() {
@@ -713,6 +731,7 @@ impl TenantMeta {
             return Ok(bucket.vnode_for(hash_id));
         }
 
+        // 有则返回副本集 没有就先创建bucket再返回
         let bucket = self.create_bucket(db, ts).await?;
 
         Ok(bucket.vnode_for(hash_id))
@@ -743,6 +762,7 @@ impl TenantMeta {
         self.client.write::<()>(&req).await
     }
 
+    // 修改vnode的状态
     pub fn change_local_vnode_status(&self, id: u32, status: VnodeStatus) -> MetaResult<()> {
         let mut data = self.data.write();
         for (_db_name, db_info) in data.dbs.iter_mut() {
@@ -811,6 +831,7 @@ impl TenantMeta {
 
     // **[6]    /cluster_name/tenants/tenant/roles/name -> [CustomTenantRole<Oid>]
     // **[6]    /cluster_name/tenants/tenant/members/oid -> [TenantRoleIdentifier]
+    // 处理租户信息
     pub async fn process_watch_log(&self, entry: &EntryLog) -> MetaResult<()> {
         let mut cache = self.data.write();
         if cache.version >= entry.ver {
@@ -829,6 +850,7 @@ impl TenantMeta {
             let _tenant = strs[3];
             let db_name = strs[5];
             let tab_name = strs[7];
+            // +/- 表
             if let Some(db) = cache.dbs.get_mut(db_name) {
                 if entry.tye == command::ENTRY_LOG_TYPE_SET {
                     if let Ok(info) = serde_json::from_str::<TableSchema>(&entry.val) {
@@ -838,6 +860,7 @@ impl TenantMeta {
                     db.tables.remove(tab_name);
                 }
             }
+            // 处理bucket相关的日记
         } else if len == 8
             && strs[6] == key_path::BUCKETS
             && strs[4] == key_path::DBS
@@ -851,6 +874,7 @@ impl TenantMeta {
                     if entry.tye == command::ENTRY_LOG_TYPE_SET {
                         if let Ok(info) = serde_json::from_str::<BucketInfo>(&entry.val) {
                             match db.buckets.binary_search_by(|v| v.id.cmp(&bucket_id)) {
+                                // update or insert
                                 Ok(index) => db.buckets[index] = info,
                                 Err(index) => db.buckets.insert(index, info),
                             }
@@ -862,6 +886,8 @@ impl TenantMeta {
                     }
                 }
             }
+
+            // 修改db信息
         } else if len == 6 && strs[4] == key_path::DBS && strs[2] == key_path::TENANTS {
             let _tenant = strs[3];
             let db_name = strs[5];
@@ -869,11 +895,14 @@ impl TenantMeta {
                 if let Ok(info) = serde_json::from_str::<DatabaseSchema>(&entry.val) {
                     let db = cache.dbs.entry(db_name.to_string()).or_default();
 
+                    // 更新db信息
                     db.schema = info;
                 }
             } else if entry.tye == command::ENTRY_LOG_TYPE_DEL {
                 cache.dbs.remove(db_name);
             }
+
+            // 修改租户下的成员
         } else if len == 6 && strs[4] == key_path::MEMBERS && strs[2] == key_path::TENANTS {
             let key = strs[5];
             if entry.tye == command::ENTRY_LOG_TYPE_SET {

@@ -195,6 +195,7 @@ pub async fn get_vnode_all_info(
     }
 }
 
+// 获取该副本集
 pub async fn get_replica_all_info(
     meta: MetaRef,
     tenant: &str,

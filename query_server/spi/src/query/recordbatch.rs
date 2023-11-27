@@ -6,9 +6,10 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::RecordBatchStream;
 use futures::Stream;
 
+// 将一组 RecordBatch 包装成stream
 pub struct RecordBatchStreamWrapper {
     inner: Vec<RecordBatch>,
-    schema: SchemaRef,
+    schema: SchemaRef,  // 数据相关的schema
     index: usize,
 }
 
@@ -31,6 +32,7 @@ impl RecordBatchStream for RecordBatchStreamWrapper {
 impl Stream for RecordBatchStreamWrapper {
     type Item = datafusion::common::Result<RecordBatch>;
 
+    // 每次poll 推进下标得到新数据
     fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Poll::Ready(if self.index < self.inner.len() {
             let batch = self.inner[self.index].clone();

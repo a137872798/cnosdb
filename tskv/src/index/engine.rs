@@ -9,20 +9,25 @@ use trace::debug;
 
 use super::{IndexError, IndexResult};
 
+// 索引引擎
 #[derive(Debug)]
 pub struct IndexEngine {
+    // 关联一个目录
     dir: PathBuf,
-
+    // 基数树中key相当于是数据页的编号 通过加载value可以得到那一页的数据
     db: radixdb::RadixTree<store::PagedFileStore>,
+    // 推测应该是代表该文件内的数据 按页分配
     store: store::PagedFileStore,
 }
 
 impl IndexEngine {
     pub fn new(path: impl AsRef<Path>) -> IndexResult<Self> {
         let path = path.as_ref();
+        // 创建目录
         let _ = fs::create_dir_all(path);
         debug!("Creating index engine : {:?}", &path);
 
+        // 创建index.db 文件
         let db_path = path.join("index.db");
         let file = fs::OpenOptions::new()
             .create(true)
@@ -31,6 +36,7 @@ impl IndexEngine {
             .open(db_path)
             .map_err(|e| IndexError::IndexStroage { msg: e.to_string() })?;
 
+        // store/db 都是在该文件上做修改
         let store = store::PagedFileStore::new(file, 1024 * 1024)
             .map_err(|e| IndexError::IndexStroage { msg: e.to_string() })?;
         let db = radixdb::RadixTree::try_load(store.clone(), store.last_id())
@@ -43,6 +49,7 @@ impl IndexEngine {
         })
     }
 
+    // 将某个数据页插入到基数树中 便于检索
     pub fn set(&mut self, key: &[u8], value: &[u8]) -> IndexResult<()> {
         self.db
             .try_insert(key, value)
@@ -51,6 +58,7 @@ impl IndexEngine {
         Ok(())
     }
 
+    // 还原该页的数据
     pub fn get(&self, key: &[u8]) -> IndexResult<Option<Vec<u8>>> {
         let val = self
             .db
@@ -67,6 +75,7 @@ impl IndexEngine {
         }
     }
 
+    // 从文件中还原出数据
     pub fn load(&self, val: &radixdb::node::Value<store::PagedFileStore>) -> IndexResult<Vec<u8>> {
         let blob = val
             .load(&self.store)
@@ -75,6 +84,7 @@ impl IndexEngine {
         Ok(blob.to_vec())
     }
 
+    // 将数据还原成一个位图 代表这个数据页内存储的是一个位图?
     pub fn get_rb(&self, key: &[u8]) -> IndexResult<Option<roaring::RoaringBitmap>> {
         if let Some(data) = self.get(key)? {
             let rb = roaring::RoaringBitmap::deserialize_from(&*data)
@@ -86,6 +96,7 @@ impl IndexEngine {
         }
     }
 
+    // 直接传入数据页 并还原出位图
     pub fn load_rb(
         &self,
         val: &radixdb::node::Value<store::PagedFileStore>,
@@ -98,7 +109,10 @@ impl IndexEngine {
         Ok(rb)
     }
 
+    // 构建倒排索引
     pub fn build_revert_index(&self, key: &[u8], id: u32, add: bool) -> IndexResult<Vec<u8>> {
+
+        // 根据key 还原出位图  这个位图本身就是倒排索引?
         let mut rb = match self.get(key)? {
             Some(val) => roaring::RoaringBitmap::deserialize_from(&*val)
                 .map_err(|e| IndexError::IndexStroage { msg: e.to_string() })?,
@@ -113,6 +127,7 @@ impl IndexEngine {
         }
 
         let mut bytes = vec![];
+        // 重新序列化
         rb.serialize_into(&mut bytes)
             .map_err(|e| IndexError::IndexStroage { msg: e.to_string() })?;
 
@@ -137,11 +152,13 @@ impl IndexEngine {
         rb.serialize_into(&mut bytes)
             .map_err(|e| IndexError::IndexStroage { msg: e.to_string() })?;
 
+        // 覆盖之前的数据页
         self.set(key, &bytes)?;
 
         Ok(())
     }
 
+    // 删除某个倒排索引
     pub fn delete(&mut self, key: &[u8]) -> IndexResult<()> {
         self.db
             .try_remove(key)
@@ -150,7 +167,9 @@ impl IndexEngine {
         Ok(())
     }
 
+    // 将2棵基数树的数据进行合并
     pub fn combine(&mut self, tree: radixdb::RadixTree) -> IndexResult<()> {
+        // 依赖第三方的api
         self.db
             .try_outer_combine_with(&tree, radixdb::node::DetachConverter, |a, b| {
                 a.set(Some(b.downcast()));
@@ -170,6 +189,7 @@ impl IndexEngine {
         Ok(result)
     }
 
+    // 产生迭代器 遍历基数树的数据页
     pub fn range(&self, range: impl RangeBounds<Vec<u8>>) -> RangeKeyValIter {
         RangeKeyValIter::new_iterator(
             copy_bound(range.start_bound()),
@@ -178,6 +198,7 @@ impl IndexEngine {
         )
     }
 
+    // 通过前缀匹配
     pub fn prefix<'a>(
         &'a self,
         key: &'a [u8],
@@ -187,6 +208,7 @@ impl IndexEngine {
             .map_err(|e| IndexError::IndexStroage { msg: e.to_string() })
     }
 
+    // 数据刷盘
     pub fn flush(&mut self) -> IndexResult<()> {
         let _id = self
             .db
@@ -201,6 +223,7 @@ impl IndexEngine {
     }
 }
 
+// copy数据 不丢失所有权
 fn copy_bound(bound: std::ops::Bound<&Vec<u8>>) -> std::ops::Bound<Vec<u8>> {
     match bound {
         std::ops::Bound::Included(val) => std::ops::Bound::Included(val.to_vec()),
@@ -225,6 +248,7 @@ impl RangeKeyValIter {
     }
 }
 
+// 迭代能力主要还是通过内部的迭代器提供的
 impl Iterator for RangeKeyValIter {
     type Item = IndexResult<(
         radixdb::node::IterKey,
@@ -238,6 +262,7 @@ impl Iterator for RangeKeyValIter {
                     return None;
                 }
 
+                // 迭代得到一个数据页
                 Some(item) => match item {
                     Err(e) => {
                         return Some(Err(IndexError::IndexStroage { msg: e.to_string() }));

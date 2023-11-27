@@ -19,6 +19,7 @@ pub type DynamicReplicaSelectionerRef = Arc<DynamicReplicaSelectioner>;
 /// 2. The copy is on the same node, same rack, and same computer room as the execution node (NodeSelector)
 /// 3. The number of read tasks performed by the storage node is small (resource management)
 /// 4. Randomly select a copy (random selection)
+/// 这里包含了3种 有关副本选择策略的对象
 pub struct DynamicReplicaSelectioner {
     status: StatusReplicaSelectionPolicy,
     topology_aware: ReplicaSelectionPolicyRef,
@@ -39,6 +40,7 @@ impl DynamicReplicaSelectioner {
     }
 
     /// Select the best replica for reading from the given vnode and its replicas
+    /// 从副本集中选择合适的副本
     pub fn select(&self, shards: Vec<ReplicationSet>) -> CoordinatorResult<Vec<ReplicationSet>> {
         let (ids, shards): (Vec<ReplicationSetId>, Vec<Vec<VnodeInfo>>) =
             shards.into_iter().map(|e| (e.id, e.vnodes)).unzip();
@@ -61,6 +63,7 @@ impl DynamicReplicaSelectioner {
     }
 }
 
+// TODO 目前未被使用的方法
 fn _filter_first_replica(
     ids: Vec<ReplicationSetId>,
     shards: Vec<Vec<VnodeInfo>>,

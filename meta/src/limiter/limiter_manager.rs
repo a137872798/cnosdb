@@ -17,8 +17,10 @@ impl LimiterKey {
     }
 }
 
+// 这个对象是在元数据服务上创建的 作为集群层面的限流器
 #[derive(Debug)]
 pub struct LimiterManager {
+    // 维护所有维度的限流器
     limiters: RwLock<HashMap<LimiterKey, Arc<dyn RequestLimiter>>>,
     factories: HashMap<LimiterType, Arc<dyn LimiterFactory>>,
 }
@@ -82,10 +84,13 @@ impl LimiterManager {
         }
     }
 
+    // 作为集群层面的限流器 需要与其他节点自动同步  所以需要一个监听日志变化的方法
     pub async fn process_watch_log(&self, tenant_name: &str, entry: &EntryLog) -> MetaResult<()> {
         if entry.tye == ENTRY_LOG_TYPE_NOP {
             return Ok(());
         }
+
+        // 从日志中还原出租户信息
         let tenant: Tenant =
             serde_json::from_str(&entry.val).map_err(|err| MetaError::SerdeMsgInvalid {
                 err: err.to_string(),
@@ -98,6 +103,7 @@ impl LimiterManager {
             };
             match self.get_limiter(&key) {
                 Some(limiter) => {
+                    // 更新配置
                     limiter.change_self(limiter_config).await?;
                 }
                 None => {

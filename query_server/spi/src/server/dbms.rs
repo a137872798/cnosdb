@@ -16,35 +16,53 @@ use crate::Result;
 
 pub type DBMSRef = Arc<dyn DatabaseManagerSystem + Send + Sync>;
 
+// 模拟一个数据库系统
 #[async_trait]
 pub trait DatabaseManagerSystem {
+    // 启动数据库
     async fn start(&self) -> Result<()>;
+
+    // 对某个用户进行认证 应该是判断该用户是否有访问某些库表的权限
     async fn authenticate(&self, user_info: &UserInfo, tenant_name: Option<&str>) -> Result<User>;
+
+    // 执行某个查询  query中包含sql语句
     async fn execute(
         &self,
         query: &Query,
         span_context: Option<&SpanContext>,
     ) -> Result<QueryHandle>;
+
+    // 基于Query生成状态机对象  状态机会随着查询的进行而切换状态
     async fn build_query_state_machine(
         &self,
         query: Query,
         span_context: Option<&SpanContext>,
     ) -> Result<QueryStateMachineRef>;
+
+    // 构建逻辑计划  这个逻辑计划 还不是datafusion层的
     async fn build_logical_plan(
         &self,
         query_state_machine: QueryStateMachineRef,
     ) -> Result<Option<Plan>>;
+
+    // 执行逻辑计划 生成的句柄是cnosdb自己封装的 而不是datafusion层
     async fn execute_logical_plan(
         &self,
         logical_plan: Plan,
         query_state_machine: QueryStateMachineRef,
     ) -> Result<QueryHandle>;
+
+    // 获取一些数据库的指标
     fn metrics(&self) -> String;
+
+    // 可以取消某个查询
     fn cancel(&self, query_id: &QueryId);
 }
 
 pub struct DatabaseManagerSystemMock {}
 
+
+// 代表一个模拟的数据库系统
 #[async_trait]
 impl DatabaseManagerSystem for DatabaseManagerSystemMock {
     async fn start(&self) -> Result<()> {

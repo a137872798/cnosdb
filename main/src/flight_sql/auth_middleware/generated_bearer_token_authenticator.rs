@@ -12,13 +12,16 @@ use super::{AuthResult, CallHeaderAuthenticator};
 use crate::flight_sql::utils;
 
 /// Generates and caches bearer tokens from user credentials.
+/// 这是一个包装对象
 #[derive(Clone)]
 pub struct GeneratedBearerTokenAuthenticator<T>
 where
     T: Clone,
 {
+    // 维护每个JWT和用户的关系
     bearer_to_identifier: Cache<String, User>,
 
+    // 内部真正工作的认证器
     initial_authenticator: T,
     id_generator: UuidGenerator,
 }
@@ -43,6 +46,7 @@ where
     }
 }
 
+// 表示如何通过该对象进行验证
 #[async_trait::async_trait]
 impl<T> CallHeaderAuthenticator for GeneratedBearerTokenAuthenticator<T>
 where
@@ -55,8 +59,10 @@ where
         debug!("authenticate, request headers: {:?}", req_headers);
 
         // Check if headers contain a bearer token and if so, validate the token.
+        // 获取JWT
         if let Some(bearer_token) = utils::get_value_from_auth_header(req_headers, BEARER_PREFIX) {
             // get user_info from cache by token
+            // 尝试从缓存获取
             let user = self
                 .bearer_to_identifier
                 .get(&bearer_token)
@@ -73,6 +79,7 @@ where
         debug!("bearer_token not exists, delegate to initial_authenticator");
 
         // Delegate to the basic auth handler to do the validation.
+        // 利用内部认证器进行认证 同时包装结果产生JWT
         let auth_result = self.initial_authenticator.authenticate(req_headers).await?;
         self.process_auth_result(auth_result)
     }
@@ -89,6 +96,7 @@ where
         let user = auth_result.identity();
         // After the user authentication is successful,
         // Generate a new bearer token and return an AuthResult that can write it.
+        // 通过UUID 来避免复杂的JWT加密算法  并且更难被破解
         let bearer_token = self.id_generator.next_id().to_string();
         // And cache the mapping between bearer and user information on the server side
         self.bearer_to_identifier
@@ -103,8 +111,10 @@ where
     }
 }
 
+// 代表某个认证结果 将用户和JWT包装在一起
 pub struct GeneratedBearerTokenAuthResult {
     user: User,
+    // 如果之前的JWT过期  返回最新的JWT
     bearer_token: Option<String>,
 }
 

@@ -16,10 +16,13 @@ use super::manager::RaftNodesManager;
 use crate::errors::*;
 
 pub struct RaftWriter {
+    // 数据节点会维护该对象 用于与元数据服务交互
     meta: MetaRef,
+    // 数据节点的各种配置
     config: config::Config,
+    // tskv存储
     kv_inst: Option<EngineRef>,
-    raft_manager: Arc<RaftNodesManager>,
+    raft_manager: Arc<RaftNodesManager>,  // 该对象管理本地所有的副本节点  某些操作当本节点为副本的leader节点时 才有权限发起
 }
 
 impl RaftWriter {
@@ -37,6 +40,7 @@ impl RaftWriter {
         }
     }
 
+    // 基于raft协议 接收某个写入请求
     pub async fn write_to_replica(
         &self,
         replica: &ReplicationSet,
@@ -45,6 +49,8 @@ impl RaftWriter {
     ) -> CoordinatorResult<()> {
         let node_id = self.config.node_basic.node_id;
         let leader_id = replica.leader_node_id;
+
+        // 作为leader节点接收写入请求
         if leader_id == node_id && self.kv_inst.is_some() {
             let span_recorder = span_recorder.child("write to local node or forward");
             let result = self
@@ -56,6 +62,7 @@ impl RaftWriter {
             result
         } else {
             let span_recorder = span_recorder.child("write to remote node");
+            // 非leader节点  转发到leader节点
             let result = self
                 .write_to_remote(leader_id, request.clone(), span_recorder.span_ctx())
                 .await;
@@ -91,18 +98,23 @@ impl RaftWriter {
         }
     }
 
+    // 通过raft协议写数据
+    // write_to_remote 也会被转发到该方法
     pub async fn write_to_local_or_forward(
         &self,
         replica: &ReplicationSet,
         request: RaftWriteCommand,
         span_ctx: Option<&SpanContext>,
     ) -> CoordinatorResult<()> {
+
         let raft = self
             .raft_manager
             .get_node_or_build(&request.tenant, &request.db_name, replica)
             .await?;
 
+        // 这个库是序列化/反序列化 protocol文件的
         let raft_data = to_prost_bytes(request.clone());
+
         let result = self.write_to_raft(raft, raft_data).await;
         if let Err(CoordinatorError::ForwardToLeader {
             replica_id: _,
@@ -116,6 +128,7 @@ impl RaftWriter {
         }
     }
 
+    // 发现leader变更时
     async fn process_leader_change(
         &self,
         leader_vnode_id: VnodeId,
@@ -133,6 +146,7 @@ impl RaftWriter {
             .ok_or(CoordinatorError::TenantNotFound {
                 name: request.tenant.clone(),
             })?
+            // 发送请求 更新leader
             .change_repl_set_leader(
                 &all_info.db_name,
                 all_info.bucket_id,
@@ -147,10 +161,12 @@ impl RaftWriter {
             request.replica_id, vnode_id, rsp
         );
 
+        // 将请求转发给leader
         self.write_to_remote(all_info.node_id, request, span_ctx)
             .await
     }
 
+    // 一般就是转发给leader节点
     async fn write_to_remote(
         &self,
         leader_id: u64,
@@ -198,7 +214,9 @@ impl RaftWriter {
         crate::status_response_to_result(&response)
     }
 
+    // 将请求写入raft状态机 成功时 会回调写入各节点  首先写入leader节点
     async fn write_to_raft(&self, raft: Arc<RaftNode>, data: Vec<u8>) -> CoordinatorResult<()> {
+        // 作为leader节点才能调用该api
         if let Err(err) = raft.raw_raft().client_write(data).await {
             if let Some(openraft::error::ForwardToLeader {
                 leader_id: Some(leader_id),

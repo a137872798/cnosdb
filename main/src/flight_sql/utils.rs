@@ -35,6 +35,7 @@ macro_rules! status {
 /// valuePrefix The prefix within the value portion of the header to extract away.
 ///
 /// @return The header value.
+/// 获取认证相关的请求头
 pub fn get_value_from_auth_header(headers: &MetadataMap, value_prefix: &str) -> Option<String> {
     get_value_from_header(headers, AUTHORIZATION.as_str(), value_prefix)
 }

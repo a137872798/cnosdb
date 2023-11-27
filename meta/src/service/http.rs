@@ -13,9 +13,13 @@ use crate::error::{MetaError, MetaResult};
 use crate::store::command::*;
 use crate::store::storage::{BtreeMapSnapshotData, StateMachine};
 
+// 元数据服务器对数据节点暴露的是http协议  raft节点之间通过grpc通信
 pub struct HttpServer {
+    // 本节点信息
     pub node: Arc<RaftNode>,
+    // 处理元数据相关请求
     pub storage: Arc<StateMachine>,
+    // 用于接收raft协议相关的请求
     pub raft_admin: Arc<RaftHttpAdmin>,
 }
 
@@ -59,6 +63,7 @@ impl HttpServer {
                         .map_err(MetaError::from)
                         .map_err(warp::reject::custom)?;
 
+                    // read操作直接在本节点执行
                     let rsp = storage.process_read_command(&req);
                     let res: Result<String, warp::Rejection> = Ok(rsp);
                     res
@@ -71,6 +76,8 @@ impl HttpServer {
             .and(warp::body::bytes())
             .and(self.with_raft_node())
             .and_then(|req: hyper::body::Bytes, node: Arc<RaftNode>| async move {
+
+                // 写入操作要记录在整个raft集群 并转发到 state_machine处理
                 match node.raw_raft().client_write(req.to_vec()).await {
                     Ok(rsp) => {
                         let resp = warp::reply::with_status(rsp.data, http::StatusCode::OK);
@@ -86,6 +93,7 @@ impl HttpServer {
                             leader_node: Some(leader_node),
                         }) = err.forward_to_leader()
                         {
+                            // leader发生变化 通知client
                             let resp = warp::reply::with_status(
                                 leader_node.address.clone().into_bytes(),
                                 http::StatusCode::PERMANENT_REDIRECT,

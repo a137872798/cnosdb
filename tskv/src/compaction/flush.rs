@@ -26,19 +26,24 @@ use crate::tsm::{self, DataBlock, TsmWriter};
 use crate::version_set::VersionSet;
 use crate::{ColumnFileId, TseriesFamilyId};
 
+// 代表当前正在刷盘的数据块
 struct FlushingBlock {
-    pub field_id: FieldId,
-    pub data_block: DataBlock,
-    pub is_delta: bool,
+    pub field_id: FieldId,  // 数据块对应的列
+    pub data_block: DataBlock,  // 数据块
+    pub is_delta: bool,  // 是否是增量数据
 }
 
+// 描述一个刷盘任务 从上层接收FlushReq后 会转换成该对象
 pub struct FlushTask {
     ts_family_id: TseriesFamilyId,
+    // 还未刷盘前 数据也是内存中的缓存
     mem_caches: Vec<Arc<RwLock<MemCache>>>,
     low_seq_no: u64,
     high_seq_no: u64,
     global_context: Arc<GlobalContext>,
+    // 本次存储数据的路径
     path_tsm: PathBuf,
+    // level0的数据被称为增量数据 并存储在另外的目录
     path_delta: PathBuf,
 }
 
@@ -63,21 +68,27 @@ impl FlushTask {
         }
     }
 
+    // 执行刷盘任务
     pub async fn run(
         self,
         version: Arc<Version>,
     ) -> Result<Option<(VersionEdit, HashMap<ColumnFileId, Arc<BloomFilter>>)>> {
         let mut total_memcache_size = 0_u64;
 
+        // 每个cache 对应一个列族
         let mut flushing_mems = Vec::with_capacity(self.mem_caches.len());
         for mem in self.mem_caches.iter() {
             flushing_mems.push(mem.read());
         }
+
+        // 以系列为单位 存储数据
         let mut flushing_mems_data: HashMap<SeriesId, Vec<Arc<RwLock<SeriesData>>>> =
             HashMap::new();
         let flushing_mems_len = flushing_mems.len();
+
         for mem in flushing_mems.into_iter() {
             total_memcache_size += mem.cache_size();
+            // 遍历每个series
             for (series_id, series_data) in mem.read_series_data() {
                 flushing_mems_data
                     .entry(series_id)
@@ -91,14 +102,18 @@ impl FlushTask {
             return Ok(None);
         }
 
+        // 当前该列族相关的最大时间戳
         let mut max_level_ts = version.max_level_ts();
         let mut column_file_metas = self
+            // 刷盘各个系列数据
             .flush_mem_caches(
                 flushing_mems_data,
                 max_level_ts,
                 tsm::MAX_BLOCK_VALUES as usize,
             )
             .await?;
+
+        // 此时已经完成刷盘了   并且需要修改version信息   version中包含了各level相关的所有数据文件
         let mut edit = VersionEdit::new(self.ts_family_id);
         for (cm, _) in column_file_metas.iter_mut() {
             cm.low_seq = self.low_seq_no;
@@ -120,29 +135,39 @@ impl FlushTask {
 
     /// Merges caches data and write them into a `.tsm` file and a `.delta` file
     /// (Sometimes one of the two file type.), returns `CompactMeta`s of the wrote files.
+    /// 以series为单位  进行数据刷盘
     async fn flush_mem_caches(
         &self,
         mut caches_data: HashMap<SeriesId, Vec<Arc<RwLock<SeriesData>>>>,
         max_level_ts: Timestamp,
-        max_data_block_size: usize,
+        max_data_block_size: usize,   // 期望每个数据块的大小
     ) -> Result<Vec<(CompactMeta, Arc<BloomFilter>)>> {
+
+        // 初始化 writer对象
         let mut writer = WriterWrapper::new(self.ts_family_id, max_level_ts, max_data_block_size);
 
+        // 存储每个series相关的列 这个是存储编码方式
         let mut column_encoding_map: HashMap<ColumnId, Encoding> = HashMap::new();
+        // 这个是存储列值
         let mut column_values_map: HashMap<ColumnId, (ValueType, Vec<(Timestamp, FieldVal)>)> =
             HashMap::new();
+
+        // 开始遍历每个系列值
         for (sid, series_datas) in caches_data.iter_mut() {
             column_encoding_map.clear();
             column_values_map.clear();
 
             // Iterates [ MemCache ] -> next_series_id -> [ SeriesData ]
+            // 遍历同一个系列id 下的各个SeriesData
             for series_data in series_datas.iter_mut() {
                 // Iterates SeriesData -> [ RowGroups{ schema_id, schema, [ RowData ] } ]
+                // 遍历各个行组  每个行组是行数据以链表形式连接的产物
                 for (_sch_id, sch_cols, rows) in series_data.read().flat_groups() {
+                    // 行组的schema中的列信息与 series的列数据是一一对应的
                     for i in sch_cols.columns().iter() {
                         column_encoding_map.insert(i.id, i.encoding);
                     }
-                    // Iterates [ RowData ]
+                    // Iterates [ RowData ]   遍历每行数据
                     for row in rows.iter() {
                         // Iterates RowData -> [ Option<FieldVal>, column_id ]
                         for (val, col) in row.fields.iter().zip(sch_cols.fields().iter()) {
@@ -157,27 +182,32 @@ impl FlushTask {
                 }
             }
 
+            // 这时填充完了某个series的全部数据 以列为单位 将数据通过writer写入到底层文件
             for (col_id, (value_type, values)) in column_values_map.iter_mut() {
                 // Sort by timestamp.
                 values.sort_by_key(|a| a.0);
                 // Dedup by timestamp.
                 utils::dedup_front_by_key(values, |a| a.0);
 
+                // 组成fieldId
                 let field_id = model_utils::unite_id(*col_id, *sid);
                 let encoding = DataBlockEncoding::new(
                     Encoding::Default,
                     column_encoding_map.get(col_id).copied().unwrap_or_default(),
                 );
+                // 写入文件
                 writer
                     .write_field(field_id, values, value_type, encoding, self)
                     .await?;
             }
+
         }
 
         // Flush the wrote files.
         writer.finish().await
     }
 
+    // 产生一个新的TsmWriter  level0是纯增量数据 其他level代表时间有重叠 所以reader在读取数据时 要关联所有level数据文件一起
     async fn new_tsm_writer(&self, is_delta: bool) -> Result<TsmWriter> {
         let dir = if is_delta {
             &self.path_delta
@@ -188,6 +218,8 @@ impl FlushTask {
     }
 }
 
+// 在处理数据合并时  如果针对热数据节点  需要先进行flush
+// 同时也有后台任务定期检测并触发刷盘
 pub async fn run_flush_memtable_job(
     req: FlushReq,
     global_context: Arc<GlobalContext>,
@@ -201,6 +233,7 @@ pub async fn run_flush_memtable_job(
     let mut version_edit = None;
     let mut file_metas: HashMap<ColumnFileId, Arc<BloomFilter>> = HashMap::new();
 
+    // VersionSet 相当于管理各个table的元数据 这里通过req.ts_family_id 找到对应的列族
     let get_tsf_result = version_set
         .read()
         .await
@@ -208,8 +241,11 @@ pub async fn run_flush_memtable_job(
         .await;
     if let Some(tsf) = get_tsf_result {
         // todo: build path by vnode data
+        // 展开列族信息
         let (storage_opt, version, database) = {
             let tsf_rlock = tsf.read().await;
+
+            // 更新最后修改时间
             tsf_rlock.update_last_modified().await;
             (
                 tsf_rlock.storage_opt(),
@@ -218,9 +254,11 @@ pub async fn run_flush_memtable_job(
             )
         };
 
+        // 产生存储数据的目录
         let path_tsm = storage_opt.tsm_dir(&database, req.ts_family_id);
         let path_delta = storage_opt.delta_dir(&database, req.ts_family_id);
 
+        // 将req转换成task
         let flush_task = FlushTask::new(
             req.ts_family_id,
             req.mems.clone(),
@@ -230,6 +268,8 @@ pub async fn run_flush_memtable_job(
             path_tsm,
             path_delta,
         );
+
+        // 这时已经完成了刷盘
         if let Some((ve, fm)) = flush_task.run(version).await? {
             let _ = version_edit.insert(ve);
             file_metas = fm;
@@ -237,6 +277,7 @@ pub async fn run_flush_memtable_job(
 
         tsf.read().await.update_last_modified().await;
 
+        // 刷盘完成 发送一个数据合并任务
         if let Some(sender) = compact_task_sender.as_ref() {
             let _ = sender.send(CompactTask::Vnode(req.ts_family_id)).await;
         }
@@ -244,6 +285,7 @@ pub async fn run_flush_memtable_job(
 
     // If there are no data to be flushed but it's a force flush,
     // just write an empty VersionEdit with the max seq_no to the summary.
+    // TODO 先忽略无数据触发flush的情况
     if version_edit.is_none() && req.force_flush {
         let mut ve = VersionEdit::new(req.ts_family_id);
         ve.has_seq_no = true;
@@ -260,11 +302,12 @@ pub async fn run_flush_memtable_job(
         let (task_state_sender, task_state_receiver) = oneshot::channel();
         let task = SummaryTask::new(
             vec![ve.clone()],
-            Some(file_metas),
-            Some(HashMap::from([(req.ts_family_id, req.mems)])),
+            Some(file_metas),  // 本次flush涉及到的数据文件
+            Some(HashMap::from([(req.ts_family_id, req.mems)])),  // 此时缓存还没有释放啊
             task_state_sender,
         );
 
+        // 往下游发送 summary任务
         if let Err(e) = summary_task_sender.send(task).await {
             warn!("Flush: failed to send summary task for {req_str}: {e}",);
         }
@@ -280,15 +323,17 @@ pub async fn run_flush_memtable_job(
     Ok(version_edit)
 }
 
+// 数据通过该对象写入
 struct WriterWrapper {
-    ts_family_id: TseriesFamilyId,
-    max_level_ts: Timestamp,
-    max_data_block_size: usize,
+    ts_family_id: TseriesFamilyId,  // 列族id
+    max_level_ts: Timestamp,   // 当前该列族数据最大时间戳
+    max_data_block_size: usize,  // 推荐一个数据块的大小
 
     /// Buffers of level-0 and level-1 data blocks:
     ///
     /// Each variant of DataBlock will be insert to a hard-coded index of buffers:
     /// `[ [ Float, Integer, Unsigned, Boolean, Bytes ]; 2 ]`
+    /// 2层buffer 外层代表level
     buffers: [[DataBlock; 5]; 2],
     /// Pointer to leve-0 and level-1 TSM writers.
     writers: [Option<TsmWriter>; 2],
@@ -317,10 +362,11 @@ impl WriterWrapper {
         }
     }
 
+    // 将内存中的列式数据写入到文件
     pub async fn write_field(
         &mut self,
         field_id: FieldId,
-        values: &[(Timestamp, FieldVal)],
+        values: &[(Timestamp, FieldVal)],  // 存储数据的容器
         value_type: &ValueType,
         encoding: DataBlockEncoding,
         flush_task: &FlushTask,
@@ -341,6 +387,8 @@ impl WriterWrapper {
         };
 
         // Split values for level-0 and levle-1.
+        // 根据时间戳  将前后数据分到不同的级别
+        // 因为时间戳数据到来可能存在滞后 之后刷盘的数据有可能比之前的还早  这些数据会被划分到level1 最新的数据处于level0
         let splited_values = match values.binary_search_by(|v| v.0.cmp(&self.max_level_ts)) {
             Ok(i) => {
                 if i == values.len() - 1 {
@@ -360,10 +408,15 @@ impl WriterWrapper {
             }
         };
         // Fill buffer and write to disk if buffer is full.
+        // level0 和level1
         for (level_idx, values) in splited_values.into_iter().enumerate() {
             for (ts, val) in values {
+
+                // 找到存储容器
                 let buffer = &mut self.buffers[level_idx][buf_idx];
+                // 将value与时间戳合并后 写入buffer
                 buffer.insert(val.data_value(*ts));
+                // 每当达到一个block大小时 写入底层文件
                 if buffer.len() > self.max_data_block_size {
                     buffer.set_encoding(encoding);
                     Self::write_tsm(&mut self.writers, flush_task, level_idx, field_id, buffer)
@@ -373,6 +426,7 @@ impl WriterWrapper {
             }
         }
         // Write the remaining data to disk.
+        // 写入buffer中的残留数据
         for (level, lvl_buffer) in self.buffers.iter_mut().enumerate() {
             let buffer = &mut lvl_buffer[buf_idx];
             if !buffer.is_empty() {
@@ -385,6 +439,7 @@ impl WriterWrapper {
         Ok(())
     }
 
+    // 将 DataBlock中的数据通过 TsmWriter写入到底层数据文件
     async fn write_tsm(
         writers: &mut [Option<TsmWriter>; 2],
         flush_task: &FlushTask,
@@ -395,6 +450,8 @@ impl WriterWrapper {
         let writer_opt = &mut writers[level];
         let writer = match writer_opt.as_mut() {
             Some(w) => w,
+
+            // 惰性初始化
             None => {
                 let writer = flush_task.new_tsm_writer(level == 0).await?;
                 info!(
@@ -406,19 +463,24 @@ impl WriterWrapper {
             }
         };
         writer
+            // 通过 TsmWriter写入数据
             .write_block(field_id, data_block)
             .await
             .context(error::WriteTsmSnafu)
     }
 
+    // 当所有cache中的数据都写入到数据文件后触发该方法
     pub async fn finish(&mut self) -> Result<Vec<(CompactMeta, Arc<BloomFilter>)>> {
         let mut column_file_metas = Vec::with_capacity(2);
         let compact_meta_builder = CompactMetaBuilder::new(self.ts_family_id);
 
         // While delta_writer is level-0, tsm_writer is level-1.
+        // 2个writer 分别对应level0 和level1
         for (level, writer) in self.writers.iter_mut().enumerate() {
             if let Some(w) = writer.as_mut() {
+                // 在写入数据的过程中 会产生索引数据 现在将索引数据写入文件
                 w.write_index().await.context(error::WriteTsmSnafu)?;
+                // 触发刷盘
                 w.finish().await.context(error::WriteTsmSnafu)?;
                 info!(
                     "Flush: File: {} write finished (level: {}, {} B).",
@@ -426,6 +488,7 @@ impl WriterWrapper {
                     level,
                     w.size()
                 );
+                // 将信息填充到 compact_meta中
                 column_file_metas.push((
                     compact_meta_builder.build(
                         w.sequence(),
@@ -434,6 +497,7 @@ impl WriterWrapper {
                         w.min_ts(),
                         w.max_ts(),
                     ),
+                    // 在写入数据文件时 会顺便填充布隆过滤器
                     Arc::new(w.bloom_filter_cloned()),
                 ));
             }

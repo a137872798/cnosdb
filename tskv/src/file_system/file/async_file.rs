@@ -116,6 +116,7 @@ impl FsRuntime {
     }
 }
 
+// 异步文件
 pub struct AsyncFile {
     inner: RawFile,
     ctx: Arc<FsRuntime>,
@@ -158,6 +159,8 @@ impl IFile for AsyncFile {
 }
 
 impl AsyncFile {
+
+    // 创建异步文件
     pub async fn open<P: AsRef<Path>>(
         path: P,
         ctx: Arc<FsRuntime>,
@@ -168,6 +171,7 @@ impl AsyncFile {
         {
             let file = asyncify(move || options.open(path)).await?;
             let inner = RawFile(Arc::new(file), ctx.rio.clone());
+            // 当使用预分配时 文件有一个初始大小
             let size = inner.file_size()?;
             Ok(AsyncFile { inner, ctx, size })
         }

@@ -44,15 +44,21 @@ use crate::status;
 
 const UNKNOWN_AFFECTED_ROWS_COUNT: i64 = -1;
 
+// 该对象实现了flight-sql特征   借助内部的DBMS提供能力
 pub struct FlightSqlServiceImpl<T> {
     instance: DBMSRef,
     authenticator: T,
+    // 用于生成UUID
     id_generator: UuidGenerator,
+    // 一个缓存对象
     result_cache: Cache<Vec<u8>, (Option<Plan>, QueryStateMachineRef)>,
 }
 
 impl<T> FlightSqlServiceImpl<T> {
+
+    /// 通过下层数据库 + 认证器 进行初始化
     pub fn new(instance: DBMSRef, authenticator: T) -> Self {
+
         let result_cache = Cache::builder()
             .thread_pool_enabled(false)
             // Time to live (TTL): 2 minutes
@@ -69,33 +75,41 @@ impl<T> FlightSqlServiceImpl<T> {
     }
 }
 
+/// 上面的这些方法 仅针对CallHeaderAuthenticator而言 这也是rust声明函数的特点 根据实现的特征来划分
 impl<T> FlightSqlServiceImpl<T>
 where
     T: CallHeaderAuthenticator + Send + Sync + 'static,
 {
+    // 代表在处理会话请求前  (也就是处理真正的请求前)
     async fn pre_precess_statement_query_req(
         &self,
-        sql: impl Into<String>,
-        req_headers: &MetadataMap,
+        sql: impl Into<String>,   // 本次要执行的sql
+        req_headers: &MetadataMap,  // grpc的请求头
         span_ctx: Option<&SpanContext>,
     ) -> Result<(Option<Plan>, QueryStateMachineRef), Status> {
-        // auth request
+
+        // auth request   处理请求前 先进行认证
         let auth_result = {
             let _span_recorder = SpanRecorder::new(span_ctx.child_span("authenticate"));
             self.authenticator.authenticate(req_headers).await?
         };
+
+        // 拿到认证的用户
         let user = auth_result.identity();
 
         // construct context by user_info and headers(parse tenant & default database)
+        // 基于当前用户构建查询上下文
         let ctx = {
             let _span_recorder = SpanRecorder::new(span_ctx.child_span("construct context"));
             self.construct_context(user, req_headers)?
         };
 
         // build query state machine
+        // 此时已经构建好上下文了
         let query_state_machine = {
             let _span_recorder =
                 SpanRecorder::new(span_ctx.child_span("build query_state_machine"));
+            // 基于本条sql 构建查询状态机
             self.build_query_state_machine(sql.into(), ctx, span_ctx)
                 .await?
         };
@@ -179,14 +193,17 @@ where
         Ok(flight_info)
     }
 
+    // 构建一个查询上下文
     fn construct_context(
         &self,
         user_info: User,
         metadata: &MetadataMap,
     ) -> Result<Context, Status> {
-        // parse tenant & default database
+        // parse tenant & default database   从请求头上获取tenant信息
         let tenant = utils::get_value_from_header(metadata, TENANT, "");
+        // 获取指定的database
         let db = utils::get_value_from_header(metadata, DB, "");
+        // 获取目标分区 查询是跟分区有关的么
         let target_partitions = utils::get_value_from_header(metadata, TARGET_PARTITIONS, "")
             .map(|e| e.parse::<usize>())
             .transpose()
@@ -196,6 +213,8 @@ where
                     TARGET_PARTITIONS, e
                 ))
             })?;
+
+        // 流触发间隔
         let stream_trigger_interval =
             utils::get_value_from_header(metadata, STREAM_TRIGGER_INTERVAL, "")
                 .map(|e| e.parse::<StreamTriggerInterval>())
@@ -206,9 +225,12 @@ where
                         STREAM_TRIGGER_INTERVAL, e
                     ))
                 })?;
+
+        // 设置目标分区 流触发间隔 选中的数据库 等等
         let ctx = ContextBuilder::new(user_info)
             .with_tenant(tenant)
             .with_database(db)
+            // 这2个分配都是跟 datafusion相关的
             .with_target_partitions(target_partitions)
             .with_stream_trigger_interval(stream_trigger_interval)
             .build();
@@ -223,7 +245,7 @@ where
         span_context: Option<&SpanContext>,
     ) -> Result<QueryStateMachineRef, Status> {
         let query = Query::new(ctx, sql.into());
-        // TODO
+
         let query_state_machine = self
             .instance
             .build_query_state_machine(query, span_context)

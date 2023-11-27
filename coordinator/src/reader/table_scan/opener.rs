@@ -21,6 +21,7 @@ use crate::reader::{VnodeOpenFuture, VnodeOpener};
 use crate::SendableCoordinatorRecordBatchStream;
 
 /// for connect a vnode and reading to a stream of [`RecordBatch`]
+/// 该对象用于打开和读取表数据   当CheckedCoordinatorRecordBatchStream 到了idle阶段后 可以打开opener
 pub struct TemporaryTableScanOpener {
     config: QueryConfig,
     kv_inst: Option<EngineRef>,
@@ -48,6 +49,8 @@ impl TemporaryTableScanOpener {
 }
 
 impl VnodeOpener for TemporaryTableScanOpener {
+
+    // 在已经通过checker检查过目标节点/表的可用性后  打开表
     fn open(&self, vnode: &VnodeInfo, option: &QueryOption) -> CoordinatorResult<VnodeOpenFuture> {
         let node_id = vnode.node_id;
         let vnode_id = vnode.id;
@@ -64,6 +67,8 @@ impl VnodeOpener for TemporaryTableScanOpener {
             if node_id == curren_nodet_id {
                 // 路由到进程内的引擎
                 let kv_inst = kv_inst.ok_or(CoordinatorError::KvInstanceNotFound { node_id })?;
+
+                // 产生读取表数据的流
                 let stream = LocalTskvTableScanStream::new(
                     vnode_id,
                     option,

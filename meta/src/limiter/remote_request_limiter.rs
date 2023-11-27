@@ -6,8 +6,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::limiter::limiter_kind::RequestLimiterKind;
 
+// 会给租户设置该限流器
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RemoteRequestLimiter {
+    // 针对不同类型 维护不同的bucket
     pub buckets: HashMap<RequestLimiterKind, RateBucket>,
 }
 

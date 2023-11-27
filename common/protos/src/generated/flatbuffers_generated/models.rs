@@ -485,6 +485,7 @@ impl core::fmt::Debug for Values<'_> {
 pub enum ColumnOffset {}
 #[derive(Copy, Clone, PartialEq)]
 
+// 用于定位一个col数据所在的位置
 pub struct Column<'a> {
   pub _tab: flatbuffers::Table<'a>,
 }
@@ -498,6 +499,8 @@ impl<'a> flatbuffers::Follow<'a> for Column<'a> {
 }
 
 impl<'a> Column<'a> {
+
+  // 记录name的偏移量
   pub const VT_NAME: flatbuffers::VOffsetT = 4;
   pub const VT_COLUMN_TYPE: flatbuffers::VOffsetT = 6;
   pub const VT_FIELD_TYPE: flatbuffers::VOffsetT = 8;
@@ -532,6 +535,7 @@ impl<'a> Column<'a> {
     // Safety:
     // Created from valid Table for this object
     // which contains a valid value in this slot
+    // 根据当前偏移量的位置 读取4字节
     unsafe { self._tab.get::<flatbuffers::ForwardsUOffset<&str>>(Column::VT_NAME, None)}
   }
   #[inline]

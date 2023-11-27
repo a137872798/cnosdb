@@ -12,6 +12,7 @@ pub use tombstone::{Tombstone, TsmTombstone};
 pub use writer::*;
 
 // MAX_BLOCK_VALUES is the maximum number of values a TSM block can store.
+// 期望每个数据块的大小
 pub(crate) const MAX_BLOCK_VALUES: u32 = 1000;
 
 const HEADER_SIZE: usize = 5;

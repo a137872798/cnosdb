@@ -183,6 +183,7 @@ impl Display for TimeRange {
     }
 }
 
+// 代表一组时间范围
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimeRanges {
     // Sorted time ranges.
@@ -1088,9 +1089,12 @@ impl Display for EqutableValueSet {
     }
 }
 
+// 在使用TsIndex时会使用到  key 为标签 value表示标签关联的value
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Domain {
+    // 代表多个范围
     Range(RangeValueSet),
+    // 代表多个具体值
     Equtable(EqutableValueSet),
     None,
     All,
@@ -1589,6 +1593,7 @@ where
     }
 }
 
+// 代表一个谓语条件  要求满足时间范围 满足标签 满足field
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolvedPredicate {
     time_ranges: Arc<TimeRanges>,

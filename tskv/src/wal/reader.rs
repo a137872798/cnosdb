@@ -41,6 +41,7 @@ pub fn parse_footer(footer: [u8; record_file::FILE_FOOTER_LEN]) -> Option<(u64, 
     Some((min_sequence, max_sequence))
 }
 
+// 包装底层的reader对象
 pub struct WalReader {
     inner: record_file::Reader,
     /// Min write sequence in the wal file, may be 0 if wal file is new or
@@ -56,6 +57,7 @@ impl WalReader {
     pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
         let reader = record_file::Reader::open(&path).await?;
 
+        // 解开footer信息
         let mut has_footer = true;
         let (min_sequence, max_sequence) = match reader.footer() {
             Some(footer) => parse_footer(footer).unwrap_or((0_u64, 0_u64)),
@@ -91,6 +93,7 @@ impl WalReader {
         self.has_footer
     }
 
+    // 每次读取一个record
     pub async fn next_wal_entry(&mut self) -> Result<Option<WalRecordData>> {
         loop {
             let data = match self.inner.read_record().await {
@@ -108,6 +111,7 @@ impl WalReader {
         }
     }
 
+    // 指定某个偏移量 开始读取一个record
     pub async fn read_wal_record_data(&mut self, pos: u64) -> Result<Option<WalRecordData>> {
         self.inner.reload_metadata().await?;
         match self.inner.read_record_at(pos as usize).await {
@@ -153,6 +157,7 @@ impl WalReader {
     }
 }
 
+// 描述读取到的record
 pub struct WalRecordData {
     pub typ: WalType,
     pub seq: u64,
@@ -160,6 +165,8 @@ pub struct WalRecordData {
 }
 
 impl WalRecordData {
+
+    // 刚读取到是一组字节 需要解析
     pub fn new(buf: Vec<u8>) -> WalRecordData {
         if buf.len() < WAL_HEADER_LEN {
             return Self {
@@ -168,9 +175,11 @@ impl WalRecordData {
                 block: Block::Unknown,
             };
         }
+        // 读取 record header
         let seq = decode_be_u64(&buf[1..9]);
         let entry_type: WalType = buf[0].into();
         let block = match entry_type {
+            // 根据不同类型 走不同的解析逻辑
             WalType::Write => Block::Write(WriteBlock::new(buf)),
             WalType::DeleteVnode => Block::DeleteVnode(DeleteVnodeBlock::new(buf)),
             WalType::DeleteTable => Block::DeleteTable(DeleteTableBlock::new(buf)),
@@ -221,6 +230,7 @@ impl WalRecordData {
     }
 }
 
+// 对应不同类型的record
 #[derive(Debug, Clone, PartialEq)]
 pub enum Block {
     Write(WriteBlock),
@@ -248,6 +258,7 @@ pub struct WriteBlock {
 impl WriteBlock {
     pub fn new(buf: Vec<u8>) -> WriteBlock {
         let tenatn_size_pos = WAL_HEADER_LEN + WAL_VNODE_ID_LEN + WAL_PRECISION_LEN;
+        // 除了这些信息外 剩下的就是数据了
         let tenant_size =
             decode_be_u64(&buf[tenatn_size_pos..tenatn_size_pos + WAL_TENANT_SIZE_LEN]) as usize;
         Self { buf, tenant_size }
@@ -277,6 +288,7 @@ impl WriteBlock {
         })
     }
 
+    // 剩下的就是有效数据
     pub fn points(&self) -> &[u8] {
         let points_pos = WAL_HEADER_LEN
             + WAL_VNODE_ID_LEN

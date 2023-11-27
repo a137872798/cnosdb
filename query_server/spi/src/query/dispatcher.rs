@@ -13,16 +13,23 @@ use crate::query::logical_planner::Plan;
 use crate::service::protocol::{Query, QueryId};
 use crate::Result;
 
+// 查询分派器
 #[async_trait]
 pub trait QueryDispatcher: Send + Sync {
+
+    // 启动分派对象
     async fn start(&self) -> Result<()>;
 
+    // 停止分派对象
     fn stop(&self);
 
+    // 产生一个查询id 应该是用来关联查询的
     fn create_query_id(&self) -> QueryId;
 
+    // 通过id获取对应的查询信息 也就是dispatcher对象 还具备一定的管理能力
     fn query_info(&self, id: &QueryId);
 
+    // 通过分派器执行逻辑  下面的几个接口 可以看到跟dbms的接口是对应的
     async fn execute_query(
         &self,
         tenant_id: Oid,
@@ -50,6 +57,7 @@ pub trait QueryDispatcher: Send + Sync {
         span: Option<&SpanContext>,
     ) -> Result<Arc<QueryStateMachine>>;
 
+    // 获取当前执行中的query信息
     fn running_query_infos(&self) -> Vec<QueryInfo>;
 
     fn running_query_status(&self) -> Vec<QueryStatus>;
@@ -57,6 +65,7 @@ pub trait QueryDispatcher: Send + Sync {
     fn cancel_query(&self, id: &QueryId);
 }
 
+// 本次查询信息/用户信息/租户信息
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryInfo {
     query_id: QueryId,
@@ -113,10 +122,11 @@ impl QueryInfo {
     }
 }
 
+// 表示查询的状态
 #[derive(Debug)]
 pub struct QueryStatus {
     state: QueryState,
-    duration: Duration,
+    duration: Duration,  // 查询已耗时
     processed_count: u64,
     error_count: u64,
 }

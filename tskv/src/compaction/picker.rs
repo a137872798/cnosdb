@@ -10,18 +10,23 @@ use crate::kv_option::StorageOptions;
 use crate::tseries_family::{ColumnFile, LevelInfo, Version};
 use crate::LevelId;
 
+// 根据当前version信息  可以产生一个合并用的req  version中的level信息包含了每个级别此时对应的一组数据文件
 pub trait Picker: Send + Sync + Debug {
     fn pick_compaction(&self, version: Arc<Version>) -> Option<CompactReq>;
 }
 
 /// Compaction picker for picking files in level
+/// 根据level进行挑选合并的对象   每次针对一个level进行合并
 #[derive(Debug)]
 pub struct LevelCompactionPicker {
+    // 此时正在挑选中
     picking: AtomicBool,
     storage: Arc<StorageOptions>,
 }
 
 impl Picker for LevelCompactionPicker {
+
+    // 挑选一个版本的数据文件 产生合并的请求
     fn pick_compaction(&self, version: Arc<Version>) -> Option<CompactReq> {
         //! 1. Get TseriesFamily's newest **version**(`Arc<Version>`)
         //! 2. Get all level's score, pick LevelInfo with the max score.
@@ -61,13 +66,16 @@ impl Picker for LevelCompactionPicker {
                 .join(", ")
         );
 
+        // 获取存储相关的选项
         let storage_opt = version.storage_opt();
+        // 获取所有level信息
         let level_infos = version.levels_info();
 
         // Pick a level to compact with level 0
         let level_start: &LevelInfo;
         let out_level;
 
+        // 找到最合适的合并级别
         if let Some((start_lvl, out_lvl)) = self.pick_level(level_infos) {
             info!("Picker: picked level: {} to {}", start_lvl, out_lvl);
             level_start = &level_infos[start_lvl as usize];
@@ -75,6 +83,7 @@ impl Picker for LevelCompactionPicker {
 
             // If start_lvl is L1, compare the number of L1 files
             // with compact_trigger_file_num.
+            // level 有一个合并的下限的 低于这个值 将不会触发合并
             if storage_opt.compact_trigger_file_num != 0
                 && start_lvl == 1
                 && (level_infos[1].files.len() as u32) < storage_opt.compact_trigger_file_num
@@ -93,18 +102,23 @@ impl Picker for LevelCompactionPicker {
 
         // Pick selected level files.
         let mut picking_files: Vec<Arc<ColumnFile>> = Vec::new();
+
+        // 数据文件为空 无法合并   然后某些文件已经在合并中了  是不参与本次合并的  这里在筛选参与合并的文件
         let (mut picking_files_size, picking_time_range) = if level_start.files.is_empty() {
             info!("Picker: picked no files from level {}", level_start.level);
             return None;
         } else {
             let mut files = level_start.files.clone();
             files.sort_by(Self::compare_column_file);
+            // max_compact_size 代表推荐一次合并的文件上限
             Self::pick_files(files, storage_opt.max_compact_size, &mut picking_files)
         };
 
         // Pick level 0 files.
         let mut files = level_infos[0].files.clone();
         files.sort_by(Self::compare_column_file);
+
+        // 这里遍历的是level0的数据文件
         for file in files.iter() {
             if file.time_range().min_ts > picking_time_range.max_ts {
                 break;
@@ -116,9 +130,12 @@ impl Picker for LevelCompactionPicker {
                 // If file already compacting, continue to next file.
                 continue;
             }
+
+            // level0的数据文件 总是会想办法参与合并的  难怪在pick_level中会跳过level0的数据文件
             picking_files.push(file.clone());
             picking_files_size += file.size();
 
+            // 直到超过单次合并的上限
             if picking_files_size > storage_opt.max_compact_size {
                 // Picked file size >= max_compact_size, try break picking files.
                 break;
@@ -144,6 +161,7 @@ impl Picker for LevelCompactionPicker {
                 .join(", ")
         );
 
+        // 将相关信息采集起来 得到本次合并的数据文件
         Some(CompactReq {
             ts_family_id: version.tf_id(),
             database: version.tenant_database(),
@@ -194,6 +212,7 @@ impl LevelCompactionPicker {
         }
     }
 
+    // 挑选一个需要合并的level
     fn pick_level(&self, levels: &[LevelInfo]) -> Option<(LevelId, LevelId)> {
         //! - Level max_size (level closer to max_size
         //!     has more possibility to run compact)
@@ -213,14 +232,17 @@ impl LevelCompactionPicker {
         }
 
         // Level score context: Vec<(level, level_size, compacting_files in level, level_weight, level_score)>
+        // 准备为每个level打分
         let mut level_scores: Vec<(LevelId, u64, usize, f64, f64)> =
             Vec::with_capacity(levels.len());
         for lvl in levels.iter() {
             // Ignore level 0 (delta files)
+            // 忽略level0 级别的数据文件  这是增量文件？  什么是增量文件
             if lvl.level == 0 || lvl.cur_size == 0 || lvl.files.len() <= 1 {
                 continue;
             }
             let mut compacting_files = 0_usize;
+            // 查看已经在合并中的文件  (合并的过程中可以读取数据吗?)
             for file in lvl.files.iter() {
                 if file.is_compacting() {
                     compacting_files += 1;
@@ -234,9 +256,11 @@ impl LevelCompactionPicker {
             //     * Self::level_weight_remaining_size(lvl.level);
             // let level_score = 10e6 * (level_file_num_weight / level_remaining_size_weight);
 
+            // 级别越小 分数越高  然后非合并中的数据文件越多 分数也越高
             let level_score: f64 = (lvl.files.len() - compacting_files) as f64
                 * Self::level_weight_file_num(lvl.level);
 
+            // 将这些信息 一股脑 存入scores中
             level_scores.push((lvl.level, lvl.cur_size, compacting_files, 0.0, level_score));
         }
 
@@ -256,6 +280,7 @@ impl LevelCompactionPicker {
                 .join(", ")
         );
 
+        // 排序后得到分数最高的级别
         level_scores.first().cloned().map(|(level, _, _, _, _)| {
             if level == 4 {
                 (level, level)
@@ -265,14 +290,18 @@ impl LevelCompactionPicker {
         })
     }
 
+    // 将本次要参与合并的文件收集到 dst_files
     fn pick_files(
         src_files: Vec<Arc<ColumnFile>>,
         max_compact_size: u64,
         dst_files: &mut Vec<Arc<ColumnFile>>,
     ) -> (u64, TimeRange) {
+        // 记录参与的总长度
         let mut picking_file_size = 0_u64;
         let mut picking_time_range = TimeRange::none();
         for file in src_files.iter() {
+            // 跳过合并中的文件   !mark_compacting 表示标记成compacting失败  合并应该是会产生中间文件 然后原文件还是可以继续读取的  当合并完成后 删除旧文件 更新文件列表
+            // 跟基于wal的存储是一个套路
             if file.is_compacting() || !file.mark_compacting() {
                 // If file already compacting, continue to next file.
                 continue;

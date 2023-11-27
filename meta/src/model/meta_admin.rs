@@ -37,6 +37,7 @@ enum TenantAction {
     Del,
 }
 
+// 代表要使用该租户
 #[derive(Debug)]
 struct UseTenantInfo {
     pub name: String,
@@ -44,20 +45,32 @@ struct UseTenantInfo {
     pub action: TenantAction,
 }
 
+// 作为服务器节点 会初始化一个该对象
 #[derive(Debug)]
 pub struct AdminMeta {
+    // cnosdb相关的配置
     config: Config,
+
+    // 通过该client与元数据服务交互
     client: MetaHttpClient,
 
+    // 记录最近观测到的元数据日志的偏移量  便于发起watch请求
     watch_version: AtomicU64,
     watch_tenants: RwLock<HashSet<String>>,
     watch_notify: Sender<UseTenantInfo>,
 
+    // 当前平台下所有用户
     users: RwLock<HashMap<String, UserDesc>>,
+
     conn_map: RwLock<HashMap<u64, Channel>>,
+
+    // 仅数据节点 (读写数据的节点) 不包含元数据节点
     data_nodes: RwLock<HashMap<u64, NodeInfo>>,
 
+    // 所有租户
     tenants: RwLock<HashMap<String, Arc<TenantMeta>>>,
+
+    // 管理各种限流
     limiters: Arc<LimiterManager>,
 }
 
@@ -84,12 +97,16 @@ impl AdminMeta {
         }
     }
 
+    // 根据配置初始化元数据客户端
     pub async fn new(config: Config) -> Arc<Self> {
         let meta_service_addr = config.cluster.meta_service_addr.clone();
         let meta_url = meta_service_addr.join(";");
         let (watch_notify, receiver) = mpsc::channel(1024);
 
+        // 通过这组地址初始化client
         let client = MetaHttpClient::new(&meta_url);
+
+        // 初始化限流器
         let limiters = Arc::new(LimiterManager::new({
             let mut map = HashMap::new();
             map.insert(
@@ -115,9 +132,11 @@ impl AdminMeta {
             watch_tenants: RwLock::new(HashSet::new()),
         });
 
+        // 先从元数据服务同步数据 (node,user)
         let base_ver = admin.sync_gobal_info().await.unwrap();
         admin.watch_version.store(base_ver, Ordering::Relaxed);
 
+        // 根据设置的租户信息 监听相关日志并在本地缓存
         tokio::spawn(AdminMeta::watch_task_manager(admin.clone(), receiver));
 
         admin
@@ -157,6 +176,7 @@ impl AdminMeta {
         info
     }
 
+    // 因为拿到了集群中所有节点信息 可以通过nodeId找到节点
     pub async fn node_info_by_id(&self, id: u64) -> MetaResult<NodeInfo> {
         if let Some(val) = self.data_nodes.read().get(&id) {
             return Ok(val.clone());
@@ -165,11 +185,13 @@ impl AdminMeta {
         Err(MetaError::NotFoundNode { id })
     }
 
+    // 获取通往某个节点的channel
     pub async fn get_node_conn(&self, node_id: u64) -> MetaResult<Channel> {
         if let Some(val) = self.conn_map.read().get(&node_id) {
             return Ok(val.clone());
         }
 
+        // 没有则进行连接
         let info = self.node_info_by_id(node_id).await?;
         let connector =
             Endpoint::from_shared(format!("http://{}", info.grpc_addr)).map_err(|err| {
@@ -190,6 +212,7 @@ impl AdminMeta {
         Ok(channel)
     }
 
+    // 获取目前最新id
     pub async fn retain_id(&self, count: u32) -> MetaResult<u32> {
         let req = command::WriteCommand::RetainID(self.config.cluster.name.clone(), count);
         let id = self.client.write::<u32>(&req).await?;
@@ -197,6 +220,7 @@ impl AdminMeta {
         Ok(id)
     }
 
+    // 从元数据服务同步数据
     pub async fn sync_gobal_info(&self) -> MetaResult<u64> {
         let req = command::ReadCommand::DataNodes(self.config.cluster.name.clone());
         let (resp, version) = self.client.read::<(Vec<NodeInfo>, u64)>(&req).await?;
@@ -208,6 +232,7 @@ impl AdminMeta {
             }
         }
 
+        // 同步所有用户信息
         let req = command::ReadCommand::Users(self.cluster());
         let resp = self.client.read::<Vec<UserDesc>>(&req).await?;
         {
@@ -222,11 +247,13 @@ impl AdminMeta {
     }
 
     /******************** Watch Meta Data Change Begin *********************/
+    // 这个方法没看到调用的地方 应该是使用者来调用 代表使用了某个租户 并开始监听该租户的数据
     pub async fn use_tenant(&self, name: &str) -> MetaResult<()> {
         if self.watch_tenants.read().contains(name) {
             return Ok(());
         }
 
+        // 代表无法使用租户
         if self.watch_tenants.read().contains(&"".to_string()) {
             return Ok(());
         }
@@ -252,13 +279,16 @@ impl AdminMeta {
         Ok(())
     }
 
+    // 开启一个监听器
     async fn watch_task_manager(admin: Arc<AdminMeta>, mut receiver: Receiver<UseTenantInfo>) {
         let mut task_handle: Option<tokio::task::JoinHandle<()>>;
 
         loop {
+            // 开始监听元数据服务的变化
             let handle = tokio::spawn(AdminMeta::watch_data_task(admin.clone()));
             task_handle = Some(handle);
 
+            // 在watch时 只有匹配的租户日记会被拉取  所以当租户发生变化 之前的watch就可以停止了
             if let Some(info) = receiver.recv().await {
                 if let Some(handle) = task_handle {
                     handle.abort();
@@ -270,6 +300,7 @@ impl AdminMeta {
                 admin.watch_version.store(base_ver, Ordering::Relaxed);
 
                 let mut tenants = admin.watch_tenants.write();
+                // empty 代表清空租户
                 if info.name.is_empty() {
                     tenants.clear();
                 }
@@ -289,25 +320,33 @@ impl AdminMeta {
         }
     }
 
+    // 开启一个监听器
     pub async fn watch_data_task(admin: Arc<AdminMeta>) {
+        // 获取所有需要监听的租户
         let tenants = admin.watch_tenants.read().clone();
+        // 获取此时最新的日志偏移量
         let base_ver = admin.watch_version.load(Ordering::Relaxed);
 
         let client_id = format!("watch.{}", admin.node_id());
         let mut request = (client_id, admin.cluster(), tenants, base_ver);
 
         let cluster_meta = admin.meta_addrs();
+
+        // 生成元数据客户端
         let client = MetaHttpClient::new(&cluster_meta);
         loop {
             let watch_rsp = client.watch::<command::WatchData>(&request).await;
             if let Ok(watch_data) = watch_rsp {
+                // 代表需要全量同步数据
                 if watch_data.full_sync {
                     let base_ver = admin.process_full_sync().await;
                     admin.watch_version.store(base_ver, Ordering::Relaxed);
                     request.3 = base_ver;
+                    // 进行下轮监控
                     continue;
                 }
 
+                // 拉取到了日记数据
                 admin.process_watch_data(&watch_data).await;
                 admin
                     .watch_version
@@ -321,9 +360,11 @@ impl AdminMeta {
         }
     }
 
+    // 拉取全量数据
     pub async fn process_full_sync(&self) -> u64 {
         loop {
             if let Ok(base_ver) = self.sync_gobal_info().await {
+                // 清空租户信息后 重新开始watch
                 self.tenants.write().clear();
                 return base_ver;
             } else {
@@ -333,6 +374,7 @@ impl AdminMeta {
         }
     }
 
+    // 处理正常拉取到的日志数据
     pub async fn process_watch_data(&self, watch_data: &command::WatchData) {
         for entry in watch_data.entry_logs.iter() {
             if entry.tye == command::ENTRY_LOG_TYPE_NOP {
@@ -341,6 +383,7 @@ impl AdminMeta {
 
             let strs: Vec<&str> = entry.key.split('/').collect();
             let len = strs.len();
+            // 集群名称不匹配  忽略
             if len < 2 || strs[1] != self.config.cluster.name {
                 continue;
             }
@@ -348,10 +391,15 @@ impl AdminMeta {
             if len > 3 && strs[2] == key_path::TENANTS {
                 let tenant_name = strs[3];
                 let opt_client = self.tenants.read().get(tenant_name).cloned();
+                // 监听限流器变化
                 let _ = self.limiters.process_watch_log(tenant_name, entry).await;
+
+                // 租户信息发生变化
                 if let Some(client) = opt_client {
                     let _ = client.process_watch_log(entry).await;
                 }
+
+                // 数据节点发生变化
             } else if len == 4 && strs[2] == key_path::DATA_NODES {
                 let _ = self.process_watch_log(entry).await;
             } else if len == 3 && strs[2] == key_path::AUTO_INCR_ID {
@@ -361,6 +409,8 @@ impl AdminMeta {
         }
     }
 
+
+    // 数据节点发生变化
     pub async fn process_watch_log(&self, entry: &EntryLog) -> MetaResult<()> {
         let strs: Vec<&str> = entry.key.split('/').collect();
 
@@ -368,14 +418,20 @@ impl AdminMeta {
         if len == 4 && strs[2] == key_path::DATA_NODES {
             if let Ok(node_id) = serde_json::from_str::<u64>(strs[3]) {
                 if entry.tye == command::ENTRY_LOG_TYPE_SET {
+
+                    // 增加节点
                     if let Ok(info) = serde_json::from_str::<NodeInfo>(&entry.val) {
                         self.data_nodes.write().insert(node_id, info);
                     }
                 } else if entry.tye == command::ENTRY_LOG_TYPE_DEL {
+
+                    // 删除节点 以及与该节点的连接
                     self.data_nodes.write().remove(&node_id);
                     self.conn_map.write().remove(&node_id);
                 }
             }
+
+            // 同步用户信息
         } else if len == 4 && strs[2] == key_path::USERS {
             if entry.tye == command::ENTRY_LOG_TYPE_SET {
                 if let Ok(user) = serde_json::from_str::<UserDesc>(&entry.val) {
@@ -403,6 +459,8 @@ impl AdminMeta {
     /******************** Watch Meta Data Change End *********************/
 
     /******************** Data Node Operation Begin *********************/
+
+    // 将本节点作为数据节点 上报到元数据服务
     pub async fn add_data_node(&self) -> MetaResult<()> {
         let mut attribute = NodeAttribute::default();
         if self.config.node_basic.cold_data_server {
@@ -425,6 +483,7 @@ impl AdminMeta {
         let cluster_name = self.config.cluster.name.clone();
         let req = command::WriteCommand::AddDataNode(cluster_name, node.clone());
         self.client.write::<()>(&req).await?;
+        // 报告本节点状态
         self.report_node_metrics().await?;
 
         self.data_nodes.write().insert(node.id, node);
@@ -432,6 +491,8 @@ impl AdminMeta {
         Ok(())
     }
 
+
+    // 返回目前集群中观测到的所有数据节点
     pub async fn data_nodes(&self) -> Vec<NodeInfo> {
         let mut nodes = vec![];
         for (_, val) in self.data_nodes.read().iter() {
@@ -441,6 +502,7 @@ impl AdminMeta {
         nodes
     }
 
+    // 报告本节点的测量数据 有助于分片和副本的划分
     pub async fn report_node_metrics(&self) -> MetaResult<()> {
         let disk_free = match get_disk_info(&self.config.storage.path) {
             Ok(size) => size,
@@ -476,6 +538,7 @@ impl AdminMeta {
     /******************** Data Node Operation End *********************/
 
     /******************** User Operation Begin *********************/
+    // 创建新用户
     pub async fn create_user(
         &self,
         name: String,
@@ -564,6 +627,7 @@ impl AdminMeta {
     /******************** User Operation End *********************/
 
     /******************** Tenant Limiter Operation Begin *********************/
+    // 创建租户数据
     pub async fn create_tenant_meta(&self, tenant_info: Tenant) -> MetaResult<MetaClientRef> {
         let tenant_name = tenant_info.name().to_string();
 
@@ -573,6 +637,7 @@ impl AdminMeta {
             config: Box::new(tenant_info.options().request_config().cloned()),
         };
 
+        // 创建相关限流器
         self.limiters.create_limiter(limiter_key, config).await?;
 
         let client = TenantMeta::new(self.cluster(), tenant_info, self.meta_addrs()).await?;
@@ -581,6 +646,7 @@ impl AdminMeta {
             .write()
             .insert(tenant_name.clone(), client.clone());
 
+        // 因为使用了这个租户 所以开始监听相关的日志
         let info = UseTenantInfo {
             name: tenant_name,
             version: client.version().await,
@@ -591,6 +657,7 @@ impl AdminMeta {
         Ok(client)
     }
 
+    // 服务可以直接发起创建租户请求 并在元数据服务上生成数据
     pub async fn create_tenant(
         &self,
         name: String,
@@ -601,10 +668,12 @@ impl AdminMeta {
         let req = command::WriteCommand::CreateTenant(self.cluster(), tenant.clone());
 
         self.client.write::<()>(&req).await?;
+        // 创建的同时 就会开始监听
         let meta_client = self.create_tenant_meta(tenant).await?;
         Ok(meta_client)
     }
 
+    // 从元数据服务获取该租户数据
     pub async fn tenant(&self, name: &str) -> MetaResult<Option<Tenant>> {
         if let Some(client) = self.tenants.read().get(name) {
             if !client.tenant().options().get_tenant_is_hidden() {
@@ -664,6 +733,7 @@ impl AdminMeta {
             return Some(client.clone());
         }
 
+        // 查询租户信息 并创建元数据
         if let Ok(Some(tenant_info)) = self.tenant(tenant).await {
             return self.create_tenant_meta(tenant_info).await.ok();
         }
@@ -671,6 +741,7 @@ impl AdminMeta {
         None
     }
 
+    // 在本地修改vnode的状态
     pub fn try_change_local_vnode_status(&self, tenant: &str, id: u32, status: VnodeStatus) {
         if let Some(client) = self.tenants.read().get(tenant) {
             info!("local change vnode status {} {:?}", id, status);
@@ -678,6 +749,7 @@ impl AdminMeta {
         }
     }
 
+    // 返回所有过期的时间桶
     pub async fn expired_bucket(&self) -> Vec<ExpiredBucketInfo> {
         let mut list = vec![];
         for (_key, val) in self.tenants.write().iter() {

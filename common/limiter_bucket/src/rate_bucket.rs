@@ -8,13 +8,15 @@ use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+// 该流量桶是集群级别的
+
 #[derive(Debug)]
 pub struct RateBucket {
-    /// Tokens to add every `per` duration.
+    /// Tokens to add every `per` duration. 每毫秒获得的token需要*这个值来扩大
     refill: usize,
-    /// Interval in milliseconds to add tokens.
+    /// Interval in milliseconds to add tokens.  上次补充时间
     interval: chrono::Duration,
-    /// Max number of tokens associated with the rate limiter.
+    /// Max number of tokens associated with the rate limiter.  token上限
     max: usize,
 
     critical: Mutex<Critical>,
@@ -193,7 +195,7 @@ unsafe impl Sync for RateBucket {}
 struct Critical {
     /// current balance of tokens,
     balance: usize,
-    /// The deadline for when more tokens can be added
+    /// The deadline for when more tokens can be added  代表多久后会添加新的token
     deadline: chrono::DateTime<Utc>,
 }
 
@@ -229,16 +231,20 @@ impl RateBucket {
         self.acquire(1)
     }
     fn update_critical(&self, critical: &mut MutexGuard<Critical>) {
+
+        // 计算可以得到距离上次又产生了多少token
         if let Some((tokens, deadline)) = calculate_drain(critical.deadline, self.interval) {
             critical.deadline = deadline;
             critical.balance = critical.balance.saturating_add(tokens * self.refill);
 
+            // 增加的token数不能超过上限
             if critical.balance > self.max {
                 critical.balance = self.max;
             }
         }
     }
 
+    // 代表分配一个最接近permit的数量
     pub fn acquire_closed(&self, permits: usize) -> usize {
         if permits == 0 {
             return 0;
@@ -257,6 +263,7 @@ impl RateBucket {
         }
     }
 
+    // 获取指定数量的permit
     pub fn acquire(&self, permits: usize) -> Result<(), String> {
         if permits == 0 {
             return Ok(());
@@ -264,6 +271,7 @@ impl RateBucket {
 
         let mut critical = self.critical.lock();
 
+        // 惰性更新
         self.update_critical(&mut critical);
 
         if let Some(balance) = critical.balance.checked_sub(permits) {
@@ -339,9 +347,11 @@ impl RateBucketBuilder {
         self
     }
 
+    // 通过该方法创建bucket
     #[allow(dead_code)]
     pub fn build(&self) -> RateBucket {
         let interval = chrono::Duration::milliseconds(self.interval);
+        // 这是第一次补充的时间
         let deadline = Utc::now() + interval;
 
         let max = match self.max {
@@ -376,23 +386,27 @@ impl Default for RateBucketBuilder {
 }
 
 fn calculate_drain(
-    deadline: DateTime<Utc>,
-    interval: chrono::Duration,
+    deadline: DateTime<Utc>,   // 下次补充token的时间
+    interval: chrono::Duration,  // 补充token的间隔时间
 ) -> Option<(usize, DateTime<Utc>)> {
     let now = Utc::now();
+
+    // 还没到deadline 无法补充token
     if now < deadline {
         return None;
     }
 
     // Time elapsed in milliseconds since the last deadline.
     let millis = interval.num_milliseconds();
+    // 计算超过了多少时间
     let since = now.signed_duration_since(deadline).num_milliseconds();
 
+    // 1毫秒生成一个token
     let tokens = usize::try_from(since / millis + 1).unwrap_or(usize::MAX);
 
     let rem = since % millis;
 
-    // Calculated time remaining until the next deadline.
+    // Calculated time remaining until the next deadline.  计算下一个deadline
     let deadline = now + (interval - chrono::Duration::milliseconds(rem));
     Some((tokens, deadline))
 }

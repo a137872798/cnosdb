@@ -9,6 +9,7 @@ use crate::store::config::MetaInit;
 use crate::store::key_path::KeyPath;
 use crate::store::storage::StateMachine;
 
+// 进行元数据服务的初始化工作
 pub async fn init_meta(storage: &StateMachine, init_data: MetaInit) {
     if storage.is_meta_init().unwrap() {
         return;
@@ -25,12 +26,13 @@ pub async fn init_meta(storage: &StateMachine, init_data: MetaInit) {
         .build()
         .expect("failed to init system tenant.");
     let oid = 78322384368497284380257291774744000001;
+    // 创建系统租户
     let tenant = Tenant::new(oid, init_data.system_tenant.clone(), tenant_opt);
     let req = WriteCommand::CreateTenant(init_data.cluster_name.clone(), tenant);
     let data = serde_json::to_vec(&req).unwrap();
     storage.apply(&ctx, &data).await.expect("expect success");
 
-    // init user
+    // init user  创建系统用户
     let user_opt = UserOptionsBuilder::default()
         .must_change_password(true)
         .comment("system admin")
@@ -42,7 +44,7 @@ pub async fn init_meta(storage: &StateMachine, init_data: MetaInit) {
     let data = serde_json::to_vec(&req).unwrap();
     storage.apply(&ctx, &data).await.expect("expect success");
 
-    // init role
+    // init role  创建系统角色
     let role = TenantRoleIdentifier::System(SystemTenantRole::Owner);
     let req = WriteCommand::AddMemberToTenant(
         init_data.cluster_name.clone(),
@@ -53,7 +55,7 @@ pub async fn init_meta(storage: &StateMachine, init_data: MetaInit) {
     let data = serde_json::to_vec(&req).unwrap();
     storage.apply(&ctx, &data).await.expect("expect success");
 
-    // init database
+    // init database  创建默认数据库
     for db in init_data.default_database.iter() {
         let req = WriteCommand::Set {
             key: KeyPath::tenant_db_name(&init_data.cluster_name, &init_data.system_tenant, db),

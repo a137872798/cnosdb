@@ -6,6 +6,7 @@ pub struct BloomFilter {
     mask: u64,
 }
 
+
 impl BloomFilter {
     /// Create a new instance of BloomFilter using m bits.
     /// The m should be a power of 2.

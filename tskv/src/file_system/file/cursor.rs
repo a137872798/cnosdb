@@ -9,6 +9,7 @@ pub struct FileCursor {
     pos: u64,
 }
 
+// 该对象提供读取文件的api
 impl FileCursor {
     pub fn into_file(self) -> AsyncFile {
         self.file
@@ -18,6 +19,7 @@ impl FileCursor {
         &self.file
     }
 
+    // 读取和设置光标
     pub fn pos(&self) -> u64 {
         self.pos
     }
@@ -26,6 +28,8 @@ impl FileCursor {
         self.pos = pos;
     }
 
+
+    // 读满buffer 并更新游标
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         let read = self.file.read_at(self.pos, buf).await?;
         self.seek(SeekFrom::Current(read.try_into().unwrap()))
@@ -33,6 +37,7 @@ impl FileCursor {
         Ok(read)
     }
 
+    // 写入数据 更新写游标
     pub async fn write(&mut self, buf: &[u8]) -> Result<usize> {
         let size = self.file.write_at(self.pos, buf).await?;
         self.seek(SeekFrom::Current(buf.len().try_into().unwrap()))
@@ -46,6 +51,7 @@ impl FileCursor {
             p += self.write_at(p, buf.deref()).await? as u64;
         }
         let pos = self.pos;
+        // 直接设定更新后的游标
         self.seek(SeekFrom::Start(p)).unwrap();
         Ok((p - pos) as usize)
     }

@@ -6,6 +6,8 @@ use datafusion::logical_expr::{AggregateUDF, ScalarUDF};
 use crate::Result;
 
 pub type FuncMetaManagerRef = Arc<dyn FunctionMetadataManager + Send + Sync>;
+
+// 给数据库引擎添加了一个注册用户自定义函数的口子 
 pub trait FunctionMetadataManager {
     fn register_udf(&mut self, udf: ScalarUDF) -> Result<()>;
 

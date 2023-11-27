@@ -23,6 +23,8 @@ pub struct HeedApplyStorage {
     db: Database<Str, Str>,
 }
 
+
+// 这是副本模块的 ApplyStorage
 impl HeedApplyStorage {
     pub fn open(path: impl AsRef<Path>) -> ReplicationResult<Self> {
         fs::create_dir_all(&path)?;
@@ -50,6 +52,8 @@ impl HeedApplyStorage {
 
 #[async_trait]
 impl ApplyStorage for HeedApplyStorage {
+
+    // 接受请求 就是简单的存储kv
     async fn apply(&self, ctx: &ApplyContext, req: &Request) -> ReplicationResult<Response> {
         #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
         struct RequestCommand {

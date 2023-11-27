@@ -11,6 +11,7 @@ use crate::{RaftNodeId, TypeConfig};
 
 #[derive(Clone)]
 pub struct RaftCBServer {
+    // 本地启动的grpc服务 可以支持多group
     nodes: Arc<RwLock<MultiRaft>>,
 }
 
@@ -19,6 +20,7 @@ impl RaftCBServer {
         Self { nodes }
     }
 
+    // 获取某个组相关的节点
     async fn get_node(&self, group_id: u32) -> std::result::Result<Arc<RaftNode>, tonic::Status> {
         let node = self
             .nodes
@@ -34,8 +36,12 @@ impl RaftCBServer {
     }
 }
 
+
+// 当leader节点进行一些操作后 可能要同步到其他节点 或者一些行为需要与其他节点交互 这时leader使用client访问follower follower作为GrpcServer
 #[tonic::async_trait]
 impl RaftService for RaftCBServer {
+
+    // 接受某节点的拉票请求
     async fn raft_vote(
         &self,
         request: tonic::Request<RaftVoteReq>,

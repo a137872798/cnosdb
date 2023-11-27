@@ -32,6 +32,7 @@ pub const STRING_CODEC: [Encoding; 7] = [
 
 pub const BOOLEAN_CODEC: [Encoding; 3] = [Encoding::Default, Encoding::Null, Encoding::BitPack];
 
+// 这里展示支持的所有编码方式
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize, Hash, Default)]
 pub enum Encoding {
     #[default]

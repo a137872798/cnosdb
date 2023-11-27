@@ -11,6 +11,7 @@ pub type OptimizerRef = Arc<dyn Optimizer + Send + Sync>;
 
 #[async_trait]
 pub trait Optimizer {
+
     async fn optimize(
         &self,
         plan: &LogicalPlan,
